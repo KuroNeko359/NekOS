@@ -1,0 +1,645 @@
+//! 进程管理
+
+use crate::arch::riscv::*;
+use crate::arch::riscv::csr::{SSTATUS_SPIE, SSTATUS_SUM};
+use crate::kernel::trap::TrapFrame;
+use crate::kernel::pgtable;
+use crate::kernel::vm;
+use crate::println;
+use spin::Mutex;
+
+extern "C" {
+    static __text_start: u8;
+    static __text_end: u8;
+    static __rodata_start: u8;
+    static __rodata_end: u8;
+}
+
+const MAX_TASKS: usize = 16;
+
+/// 进程状态
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TaskState {
+    Unused,
+    Ready,
+    Running,
+    Sleeping,
+    Zombie,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitChannel {
+    Child(u32),
+    UartRx,
+}
+
+/// 进程控制块
+pub struct Task {
+    pub pid: u32,
+    pub state: TaskState,
+    pub trap_frame: usize,
+    pub kernel_stack: usize,
+    pub user_stack: usize,
+    pub entry: usize,
+    pub pagetable: &'static mut pgtable::PageTable,
+    pub exit_code: i32,
+    pub image_base: usize,
+    pub image_size: usize,
+    pub builtin_image: bool,
+    pub parent_pid: Option<u32>,
+    pub waiting_for: Option<WaitChannel>,
+}
+
+pub enum WaitResult {
+    Reaped(i32),
+    Blocked(*mut TrapFrame),
+    Error,
+}
+
+/// 进程管理器
+pub struct TaskManager {
+    /// 当前进程
+    current_pid: Option<u32>,
+    /// 进程列表
+    tasks: [Option<Task>; MAX_TASKS],
+    /// 下一个PID
+    next_pid: u32,
+    /// 可运行进程数
+    runnable_count: u32,
+}
+
+/// 全局进程管理器
+static TASK_MANAGER: Mutex<Option<TaskManager>> = Mutex::new(None);
+
+impl TaskManager {
+    fn free_user_space(
+        pagetable: &mut pgtable::PageTable,
+        user_stack: usize,
+        image_base: usize,
+        image_size: usize,
+        builtin_image: bool,
+    ) {
+        if !builtin_image {
+            let start = image_base & !(PAGE_SIZE - 1);
+            let end = (image_base + image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            for va in (start..end).step_by(PAGE_SIZE) {
+                if let Some(pte) = pgtable::walk(pagetable, va, false) {
+                    if (*pte & PTE_V) != 0 {
+                        crate::kernel::page::free(pgtable::pte_to_pa(*pte));
+                        *pte = 0;
+                    }
+                }
+            }
+        }
+        crate::kernel::page::free(user_stack);
+        pgtable::free(pagetable);
+    }
+
+    fn free_address_space(task: &mut Task) {
+        Self::free_user_space(
+            task.pagetable,
+            task.user_stack,
+            task.image_base,
+            task.image_size,
+            task.builtin_image,
+        );
+    }
+
+    fn free_task(mut task: Task) {
+        Self::free_address_space(&mut task);
+        crate::kernel::page::free(task.kernel_stack);
+    }
+
+    fn reap_detached_zombies(&mut self) {
+        let current_pid = self.current_pid;
+        for index in 0..MAX_TASKS {
+            let reap = self.tasks[index].as_ref().is_some_and(|task| {
+                task.state == TaskState::Zombie
+                    && task.parent_pid.is_none()
+                    && Some(task.pid) != current_pid
+            });
+            if reap {
+                let task = self.tasks[index].take().unwrap();
+                println!("task reap: pid={} exit_code={}", task.pid, task.exit_code);
+                Self::free_task(task);
+            }
+        }
+    }
+
+    fn map_builtin(pagetable: &mut pgtable::PageTable) -> Result<(), ()> {
+        let text_start = unsafe { &__text_start as *const u8 as usize } & !(PAGE_SIZE - 1);
+        let text_end = (unsafe { &__text_end as *const u8 as usize } + PAGE_SIZE - 1)
+            & !(PAGE_SIZE - 1);
+        pgtable::set_flags(pagetable, text_start, text_end - text_start, PTE_R | PTE_X | PTE_U)?;
+
+        let rodata_start = unsafe { &__rodata_start as *const u8 as usize } & !(PAGE_SIZE - 1);
+        let rodata_end = (unsafe { &__rodata_end as *const u8 as usize } + PAGE_SIZE - 1)
+            & !(PAGE_SIZE - 1);
+        pgtable::set_flags(pagetable, rodata_start, rodata_end - rodata_start, PTE_R | PTE_U)
+    }
+
+    fn init_context(
+        kernel_stack: usize,
+        pagetable: &pgtable::PageTable,
+        frame: &TrapFrame,
+    ) -> usize {
+        let frame_addr = kernel_stack + PAGE_SIZE - 16 - core::mem::size_of::<TrapFrame>();
+        unsafe {
+            (frame_addr as *mut TrapFrame).write(frame.clone());
+            ((frame_addr + core::mem::size_of::<TrapFrame>()) as *mut usize)
+                .write(vm::kernel_satp());
+            ((frame_addr + core::mem::size_of::<TrapFrame>() + 8) as *mut usize)
+                .write((8usize << 60) | ((pagetable as *const pgtable::PageTable as usize) >> PAGE_SHIFT));
+        }
+        frame_addr
+    }
+
+    /// 创建新的进程管理器
+    pub fn new() -> Self {
+        Self {
+            current_pid: None,
+            tasks: core::array::from_fn(|_| None),
+            next_pid: 1,
+            runnable_count: 0,
+        }
+    }
+    
+    /// 创建新的用户进程
+    pub fn create_user(
+        &mut self,
+        image_start: usize,
+        image_end: usize,
+        entry: usize,
+    ) -> Result<u32, ()> {
+        // 分配内核栈
+        let kernel_stack = crate::kernel::page::alloc().ok_or(())?;
+        
+        // 分配用户栈
+        let user_stack = crate::kernel::page::alloc().ok_or(())?;
+        
+        // 创建页表
+        let pagetable = pgtable::create().ok_or(())?;
+        
+        vm::map_kernel(pagetable)?;
+        Self::map_builtin(pagetable)?;
+
+        let user_entry = entry;
+        
+        // 映射用户栈
+        pgtable::map(
+            pagetable,
+            USER_STACK_TOP - PAGE_SIZE,
+            user_stack,
+            PAGE_SIZE,
+            PTE_R | PTE_W | PTE_U,
+        )?;
+        
+        // 创建进程
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        
+        let mut initial_frame = TrapFrame::new();
+        initial_frame.sp = USER_STACK_TOP;
+        initial_frame.sepc = user_entry;
+        initial_frame.sstatus = SSTATUS_SPIE | SSTATUS_SUM;
+        let trap_frame = Self::init_context(kernel_stack, pagetable, &initial_frame);
+
+        let task = Task {
+            pid,
+            state: TaskState::Ready,
+            trap_frame,
+            kernel_stack,
+            user_stack,
+            entry: user_entry,
+            pagetable,
+            exit_code: 0,
+            image_base: image_start,
+            image_size: image_end - image_start,
+            builtin_image: true,
+            parent_pid: self.current_pid,
+            waiting_for: None,
+        };
+        
+        let slot = self.tasks.iter_mut().find(|slot| slot.is_none()).ok_or(())?;
+        *slot = Some(task);
+        self.runnable_count += 1;
+        
+        println!("task create user: pid={} entry=0x{:x} user_sp=0x{:x}", 
+                 pid, user_entry, USER_STACK_TOP);
+        
+        Ok(pid)
+    }
+    
+    /// 获取当前进程
+    pub fn current(&self) -> Option<&Task> {
+        let pid = self.current_pid?;
+        self.tasks
+            .iter()
+            .filter_map(|task| task.as_ref())
+            .find(|task| task.pid == pid)
+    }
+    
+    /// 获取当前进程 (可变)
+    pub fn current_mut(&mut self) -> Option<&mut Task> {
+        let pid = self.current_pid?;
+        self.tasks
+            .iter_mut()
+            .filter_map(|task| task.as_mut())
+            .find(|task| task.pid == pid)
+    }
+    
+    /// 设置当前进程
+    pub fn set_current(&mut self, pid: u32) {
+        for task in self.tasks.iter_mut().filter_map(|task| task.as_mut()) {
+            if task.pid == pid {
+                task.state = TaskState::Running;
+                self.current_pid = Some(pid);
+                break;
+            }
+        }
+    }
+    
+    /// 调度下一个进程
+    pub fn schedule(&mut self, tf: &TrapFrame) -> usize {
+        self.reap_detached_zombies();
+        let current_index = self.current_pid.and_then(|pid| {
+            self.tasks.iter().position(|slot| slot.as_ref().is_some_and(|task| task.pid == pid))
+        });
+        if let Some(index) = current_index {
+            if let Some(current) = self.tasks[index].as_mut() {
+                unsafe { (current.trap_frame as *mut TrapFrame).write(tf.clone()); }
+                if current.state == TaskState::Running { current.state = TaskState::Ready; }
+            }
+        }
+
+        let start = current_index.map_or(0, |index| (index + 1) % MAX_TASKS);
+        for offset in 0..MAX_TASKS {
+            let index = (start + offset) % MAX_TASKS;
+            if self.tasks[index].as_ref().is_some_and(|task| task.state == TaskState::Ready) {
+                let task = self.tasks[index].as_mut().unwrap();
+                task.state = TaskState::Running;
+                self.current_pid = Some(task.pid);
+                return task.trap_frame;
+            }
+        }
+        tf as *const TrapFrame as usize
+    }
+
+    pub fn fork(&mut self, tf: &mut TrapFrame) -> Result<u32, ()> {
+        let parent_index = self.tasks.iter().position(|slot| {
+            slot.as_ref().is_some_and(|task| Some(task.pid) == self.current_pid)
+        }).ok_or(())?;
+        let (builtin, image_base, image_size, entry, parent_stack, parent_pt) = {
+            let parent = self.tasks[parent_index].as_mut().ok_or(())?;
+            (parent.builtin_image, parent.image_base, parent.image_size, parent.entry,
+             parent.user_stack, parent.pagetable as *mut pgtable::PageTable)
+        };
+
+        let child_kernel_stack = crate::kernel::page::alloc().ok_or(())?;
+        let child_user_stack = crate::kernel::page::alloc().ok_or(())?;
+        let child_pt = pgtable::create().ok_or(())?;
+        vm::map_kernel(child_pt)?;
+        if builtin {
+            Self::map_builtin(child_pt)?;
+        } else {
+            let start = image_base & !(PAGE_SIZE - 1);
+            let end = (image_base + image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            for va in (start..end).step_by(PAGE_SIZE) {
+                let source_pte = pgtable::walk(unsafe { &mut *parent_pt }, va, false)
+                    .map(|pte| *pte).filter(|pte| pte & PTE_V != 0);
+                let Some(source_pte) = source_pte else { continue };
+                let page = crate::kernel::page::alloc().ok_or(())?;
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        pgtable::pte_to_pa(source_pte) as *const u8,
+                        page as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                pgtable::map(child_pt, va, page, PAGE_SIZE, source_pte & 0x3fe)?;
+            }
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                parent_stack as *const u8,
+                child_user_stack as *mut u8,
+                PAGE_SIZE,
+            );
+        }
+        pgtable::map(
+            child_pt,
+            USER_STACK_TOP - PAGE_SIZE,
+            child_user_stack,
+            PAGE_SIZE,
+            PTE_R | PTE_W | PTE_U,
+        )?;
+
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        let mut child_frame = tf.clone();
+        child_frame.a0 = 0;
+        let child_tf = Self::init_context(child_kernel_stack, child_pt, &child_frame);
+        let child = Task {
+            pid,
+            state: TaskState::Ready,
+            trap_frame: child_tf,
+            kernel_stack: child_kernel_stack,
+            user_stack: child_user_stack,
+            entry,
+            pagetable: child_pt,
+            exit_code: 0,
+            image_base,
+            image_size,
+            builtin_image: builtin,
+            parent_pid: self.current_pid,
+            waiting_for: None,
+        };
+        let slot = self.tasks.iter_mut().find(|slot| slot.is_none()).ok_or(())?;
+        *slot = Some(child);
+        self.runnable_count += 1;
+        tf.a0 = pid as usize;
+        println!("fork: parent={} child={}", self.current_pid.unwrap_or(0), pid);
+        Ok(pid)
+    }
+
+    pub fn replace_current(
+        &mut self,
+        pagetable: &'static mut pgtable::PageTable,
+        user_stack: usize,
+        entry: usize,
+        image_base: usize,
+        image_size: usize,
+        tf: &mut TrapFrame,
+    ) -> Result<(), ()> {
+        let user_satp = (8usize << 60)
+            | ((pagetable as *const pgtable::PageTable as usize) >> PAGE_SHIFT);
+        let (old_pagetable, old_user_stack, old_image_base, old_image_size, old_builtin) = {
+            let current = self.current_mut().ok_or(())?;
+            let old_pagetable = core::mem::replace(&mut current.pagetable, pagetable);
+            let old = (
+                old_pagetable,
+                current.user_stack,
+                current.image_base,
+                current.image_size,
+                current.builtin_image,
+            );
+            current.user_stack = user_stack;
+            current.entry = entry;
+            current.image_base = image_base;
+            current.image_size = image_size;
+            current.builtin_image = false;
+            unsafe {
+                ((current.trap_frame + core::mem::size_of::<TrapFrame>() + 8) as *mut usize)
+                    .write(user_satp);
+            }
+            old
+        };
+        tf.sp = USER_STACK_TOP;
+        tf.sepc = entry;
+        tf.a0 = 0;
+        tf.a1 = 0;
+        tf.a2 = 0;
+        Self::free_user_space(
+            old_pagetable,
+            old_user_stack,
+            old_image_base,
+            old_image_size,
+            old_builtin,
+        );
+        Ok(())
+    }
+
+    pub fn waitpid(&mut self, pid: u32, tf: &TrapFrame) -> WaitResult {
+        let Some(parent_pid) = self.current_pid else { return WaitResult::Error };
+        let Some(child_index) = self.tasks.iter().position(|slot| {
+            slot.as_ref().is_some_and(|task| task.pid == pid && task.parent_pid == Some(parent_pid))
+        }) else {
+            return WaitResult::Error;
+        };
+
+        if self.tasks[child_index].as_ref().unwrap().state == TaskState::Zombie {
+            let task = self.tasks[child_index].take().unwrap();
+            let exit_code = task.exit_code;
+            println!("task reap: pid={} exit_code={}", task.pid, exit_code);
+            Self::free_task(task);
+            return WaitResult::Reaped(exit_code);
+        }
+
+        let Some(parent) = self.current_mut() else { return WaitResult::Error };
+        parent.state = TaskState::Sleeping;
+        parent.waiting_for = Some(WaitChannel::Child(pid));
+        unsafe { (parent.trap_frame as *mut TrapFrame).write(tf.clone()); }
+        self.runnable_count = self.runnable_count.saturating_sub(1);
+        WaitResult::Blocked(self.schedule(tf) as *mut TrapFrame)
+    }
+    
+    /// 退出当前进程
+    pub fn exit_current(&mut self, code: i32) -> Option<usize> {
+        let mut exited_pid = None;
+        let mut parent_pid = None;
+
+        if let Some(current) = self.current_mut() {
+            current.state = TaskState::Zombie;
+            current.exit_code = code;
+            exited_pid = Some(current.pid);
+            parent_pid = current.parent_pid;
+        }
+
+        if let Some(pid) = exited_pid {
+            self.runnable_count -= 1;
+            println!("task exit: pid={} code={}", pid, code);
+
+            // 父进程退出后，其子进程成为孤儿；Zombie 会在安全时机回收。
+            for child in self.tasks.iter_mut().filter_map(|task| task.as_mut()) {
+                if child.parent_pid == Some(pid) {
+                    child.parent_pid = None;
+                }
+            }
+        }
+
+        // 如果父进程正阻塞在 waitpid 上，写回退出码并唤醒它。
+        if let (Some(child_pid), Some(parent_pid)) = (exited_pid, parent_pid) {
+            let parent_index = self.tasks.iter().position(|slot| {
+                slot.as_ref().is_some_and(|task| task.pid == parent_pid)
+            });
+            if let Some(index) = parent_index {
+                let waiting = self.tasks[index].as_ref().is_some_and(|parent| {
+                    parent.state == TaskState::Sleeping && parent.waiting_for == Some(WaitChannel::Child(child_pid))
+                });
+                if waiting {
+                    let parent = self.tasks[index].as_mut().unwrap();
+                    parent.state = TaskState::Ready;
+                    parent.waiting_for = None;
+                    unsafe { (*(parent.trap_frame as *mut TrapFrame)).a0 = code as usize; }
+                    self.runnable_count += 1;
+                    if let Some(child) = self.tasks.iter_mut().filter_map(|task| task.as_mut())
+                        .find(|task| task.pid == child_pid)
+                    {
+                        child.parent_pid = None;
+                    }
+                }
+            }
+        }
+        
+        // 调度下一个进程
+        self.current_pid = None;
+        
+        // 查找下一个可运行进程
+        for task in self.tasks.iter_mut().filter_map(|task| task.as_mut()) {
+            if task.state == TaskState::Ready {
+                task.state = TaskState::Running;
+                self.current_pid = Some(task.pid);
+                return Some(task.trap_frame);
+            }
+        }
+        
+        None
+    }
+    
+    /// 列出所有进程
+    pub fn list_all(&self) {
+        println!("PID    STATE        ENTRY      USER_SP   ");
+        println!("------ ------------ ---------- ----------");
+        
+        for task in self.tasks.iter().filter_map(|task| task.as_ref()) {
+            let state = match task.state {
+                TaskState::Unused => "UNUSED",
+                TaskState::Ready => "READY",
+                TaskState::Running => "RUNNING",
+                TaskState::Sleeping => "SLEEPING",
+                TaskState::Zombie => "ZOMBIE",
+            };
+            
+            println!("{:<6} {:<12} 0x{:08x} 0x{:08x}", 
+                     task.pid, state, task.entry, USER_STACK_TOP);
+        }
+        
+        println!("total: {} runnable", self.runnable_count);
+    }
+}
+
+/// 初始化进程管理
+pub fn init() {
+    *TASK_MANAGER.lock() = Some(TaskManager::new());
+}
+
+/// 创建用户进程
+pub fn create_user(image_start: usize, image_end: usize, entry: usize) -> Result<u32, ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.create_user(image_start, image_end, entry)
+}
+
+/// 设置当前进程
+pub fn set_current(pid: u32) {
+    TASK_MANAGER.lock().as_mut().unwrap().set_current(pid);
+}
+
+/// 获取当前进程PID
+pub fn current_pid() -> u32 {
+    TASK_MANAGER.lock()
+        .as_ref()
+        .and_then(|m| m.current())
+        .map(|t| t.pid)
+        .unwrap_or(0)
+}
+
+/// 获取进程的内核栈顶
+pub fn kernel_stack_top(pid: u32) -> Option<usize> {
+    TASK_MANAGER
+        .lock()
+        .as_ref()
+        .and_then(|manager| {
+            manager
+                .tasks
+                .iter()
+                .filter_map(|task| task.as_ref())
+                .find(|task| task.pid == pid)
+                .map(|task| task.kernel_stack + PAGE_SIZE)
+        })
+}
+
+/// 获取任务页表对应的 SATP 值。
+pub fn task_satp(pid: u32) -> Option<usize> {
+    TASK_MANAGER
+        .lock()
+        .as_ref()
+        .and_then(|manager| {
+            manager
+                .tasks
+                .iter()
+                .filter_map(|task| task.as_ref())
+                .find(|task| task.pid == pid)
+                .map(|task| {
+                    (8usize << 60)
+                        | ((task.pagetable as *const pgtable::PageTable as usize) >> PAGE_SHIFT)
+                })
+        })
+}
+
+/// 调度下一个进程
+pub fn schedule(tf: &TrapFrame) -> *mut TrapFrame {
+    TASK_MANAGER.lock().as_mut().unwrap().schedule(tf) as *mut TrapFrame
+}
+
+/// 退出当前进程
+pub fn exit_current(code: i32) -> *mut TrapFrame {
+    if let Some(next) = TASK_MANAGER
+        .lock()
+        .as_mut()
+        .and_then(|manager| manager.exit_current(code))
+    {
+        return next as *mut TrapFrame;
+    }
+
+    crate::arch::riscv::sbi::shutdown();
+
+    loop {
+        unsafe { core::arch::asm!("wfi") };
+    }
+}
+
+pub fn fork(tf: &mut TrapFrame) -> Result<u32, ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.fork(tf)
+}
+
+pub fn waitpid(pid: u32, tf: &TrapFrame) -> WaitResult {
+    TASK_MANAGER
+        .lock()
+        .as_mut()
+        .map(|manager| manager.waitpid(pid, tf))
+        .unwrap_or(WaitResult::Error)
+}
+
+pub fn replace_current(
+    pagetable: &'static mut pgtable::PageTable,
+    user_stack: usize,
+    entry: usize,
+    image_base: usize,
+    image_size: usize,
+    tf: &mut TrapFrame,
+) -> Result<(), ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.replace_current(
+        pagetable, user_stack, entry, image_base, image_size, tf,
+    )
+}
+
+pub fn translate_user(va: usize) -> Option<usize> {
+    TASK_MANAGER.lock().as_mut()?.current_mut().and_then(|task| {
+        pgtable::virt_to_phys(task.pagetable, va)
+    })
+}
+
+/// 列出所有进程
+pub fn list_all() {
+    TASK_MANAGER.lock().as_ref().unwrap().list_all();
+}
+
+/// 外部汇编函数
+extern "C" {
+    pub fn enter_user(
+        user_stack_top: usize,
+        user_entry: usize,
+        trap_stack: usize,
+        kernel_satp: usize,
+        user_satp: usize,
+    );
+}

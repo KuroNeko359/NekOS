@@ -1,0 +1,19 @@
+[package]
+name = "riscv-os-rust"
+version = "0.1.0"
+edition = "2021"
+authors = ["kuroneko359"]
+description = "A RISC-V microkernel operating system written in Rust"
+
+[[bin]]
+name = "riscv-os-rust"
+path = "src/main.rs"
+
+[dependencies]
+spin = "0.9"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
