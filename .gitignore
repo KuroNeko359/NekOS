@@ -1,2 +1,31 @@
-/target
-Cargo.lock
+# Rust / Cargo build output
+/target/
+/build/
+
+# Generated kernel and initrd artifacts
+*.o
+*.a
+*.elf
+*.bin
+*.cpio
+*.map
+
+# IDE settings
+/.idea/
+/.vscode/
+*.iml
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# Logs, temporary files and editor backups
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Crash dumps
+core
+core.*
