@@ -7,7 +7,7 @@
 - **Sv39 虚拟内存**: 支持 39 位虚拟地址空间
 - **进程管理**: 支持用户态进程创建和调度
 - **同步 IPC**: endpoint、call、recv、reply
-- **用户态服务**: Console Server 独占 UART MMIO，Shell 通过 IPC 访问终端
+- **独立用户态服务**: Console Server 与 Shell 作为 ELF 从 initrd 加载，Shell 通过 IPC 访问终端
 - **中断驱动输入**: Console Server 通过 irq_wait 阻塞，UART RX 中断到达后由内核唤醒
 - **进程生命周期**: fork、exec、waitpid、Zombie 回收
 - **陷阱处理**: 支持中断和异常处理
@@ -45,6 +45,11 @@ riscv-os-rust/
 ├── Makefile            # 构建脚本
 ├── linker.ld           # 链接脚本
 ├── build.rs            # 构建脚本
+├── programs/
+│   ├── console.rs      # 独立 Console Server ELF 入口
+│   ├── shell.rs        # 独立 Shell ELF 入口
+│   ├── hello.S         # exec 测试程序
+│   └── user.ld         # 用户 ELF 链接脚本
 ├── src/
 │   ├── main.rs         # 内核入口点
 │   ├── arch/
@@ -72,7 +77,7 @@ riscv-os-rust/
 │   │   ├── plic.rs     # PLIC 外部中断控制器
 │   │   └── uart.rs     # UART 驱动
 │   └── user/
-│       ├── mod.rs      # 用户模块
+│       ├── io.rs       # 用户态 read/write 接口
 │       ├── ipc.rs      # 用户态 IPC 系统调用封装
 │       ├── console.rs  # 用户态 Console Server
 │       └── shell.rs    # 用户 Shell
@@ -99,8 +104,10 @@ riscv-os-rust/
 
 ## 微内核边界
 
-内核负责地址空间、任务调度、陷阱、定时器和 IPC endpoint。Console Server 运行在 U-mode，
-是唯一获得 UART MMIO 用户映射的任务；Shell 不直接访问 UART，而是通过 endpoint 1 同步调用服务。
+内核负责地址空间、ELF 加载、任务调度、陷阱、定时器和 IPC endpoint。启动时内核从 initrd
+分别加载 `console` 和 `shell` ELF；它们不再链接进内核，也不能访问内核代码页。Console Server
+运行在 U-mode，是唯一获得 UART MMIO 用户映射的任务；Shell 不直接访问 UART，而是通过
+endpoint 1 同步调用服务。
 Console 等待输入时调用 `irq_wait` 进入 Sleeping，UART RX 中断将其唤醒；没有普通任务可运行时
 PID 0 执行 `wfi`。
 `read/write` 系统调用目前仅作为 initrd 旧程序的兼容接口保留，后续服务全部迁移后可删除。

@@ -28,6 +28,27 @@ fn archive_obj(obj: &PathBuf, archive: &PathBuf) {
     assert!(status.success(), "{} archive failed", archive.display());
 }
 
+fn compile_rust_user(src: &PathBuf, elf: &PathBuf, linker_script: &PathBuf) {
+    let rustc = env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let status = Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("--crate-type=bin")
+        .arg("--target=riscv64gc-unknown-none-elf")
+        .arg("-Copt-level=z")
+        .arg("-Cpanic=abort")
+        .arg("-Crelocation-model=static")
+        .arg("-Cstrip=symbols")
+        .arg("-Clink-arg=--gc-sections")
+        .arg(format!("-Clink-arg=-T{}", linker_script.display()))
+        .arg("-o")
+        .arg(elf)
+        .arg(src)
+        .status()
+        .expect("Failed to compile Rust user program");
+
+    assert!(status.success(), "{} compilation failed", src.display());
+}
+
 fn append_newc_entry(archive: &mut Vec<u8>, name: &str, data: &[u8], ino: u32) {
     let namesize = name.len() + 1;
     let header = format!(
@@ -67,13 +88,27 @@ fn main() {
     archive_obj(&trap_obj, &trap_lib);
     archive_obj(&user_obj, &user_lib);
 
-    // 构建一个独立用户 ELF，并打包成内嵌 newc initrd。
+    // 构建独立用户 ELF，并打包成内嵌 newc initrd。
     let programs_dir = src_dir.join("programs");
+    let user_linker_script = programs_dir.join("user.ld");
+    let console_elf = out_dir.join("console");
+    let shell_elf = out_dir.join("shell");
+    compile_rust_user(
+        &programs_dir.join("console.rs"),
+        &console_elf,
+        &user_linker_script,
+    );
+    compile_rust_user(
+        &programs_dir.join("shell.rs"),
+        &shell_elf,
+        &user_linker_script,
+    );
+
     let hello_obj = out_dir.join("hello.o");
     let hello_elf = out_dir.join("hello");
     compile_asm(&programs_dir.join("hello.S"), &hello_obj);
     let status = Command::new("riscv64-elf-ld")
-        .args(["-T", programs_dir.join("user.ld").to_str().unwrap(), "-o"])
+        .args(["-T", user_linker_script.to_str().unwrap(), "-o"])
         .arg(&hello_elf)
         .arg(&hello_obj)
         .status()
@@ -81,8 +116,10 @@ fn main() {
     assert!(status.success(), "user program link failed");
 
     let mut cpio = Vec::new();
-    append_newc_entry(&mut cpio, "hello", &fs::read(&hello_elf).unwrap(), 1);
-    append_newc_entry(&mut cpio, "TRAILER!!!", &[], 2);
+    append_newc_entry(&mut cpio, "console", &fs::read(&console_elf).unwrap(), 1);
+    append_newc_entry(&mut cpio, "shell", &fs::read(&shell_elf).unwrap(), 2);
+    append_newc_entry(&mut cpio, "hello", &fs::read(&hello_elf).unwrap(), 3);
+    append_newc_entry(&mut cpio, "TRAILER!!!", &[], 4);
     let initrd_bin = out_dir.join("rootfs.cpio");
     fs::write(&initrd_bin, cpio).unwrap();
     let initrd_bin_obj = out_dir.join("initrd-bin.o");
@@ -118,8 +155,14 @@ fn main() {
     println!("cargo:rerun-if-changed=src/arch/riscv/start.S");
     println!("cargo:rerun-if-changed=src/arch/riscv/trap.S");
     println!("cargo:rerun-if-changed=src/arch/riscv/user.S");
+    println!("cargo:rerun-if-changed=programs/console.rs");
+    println!("cargo:rerun-if-changed=programs/shell.rs");
     println!("cargo:rerun-if-changed=programs/hello.S");
     println!("cargo:rerun-if-changed=programs/user.ld");
+    println!("cargo:rerun-if-changed=src/user/console.rs");
+    println!("cargo:rerun-if-changed=src/user/io.rs");
+    println!("cargo:rerun-if-changed=src/user/ipc.rs");
+    println!("cargo:rerun-if-changed=src/user/shell.rs");
     println!("cargo:rerun-if-changed=src/arch/riscv/initrd.S");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=build.rs");

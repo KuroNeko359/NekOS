@@ -61,6 +61,14 @@ const PF_X: u32 = 0x1;  // Execute
 const PF_W: u32 = 0x2;  // Write
 const PF_R: u32 = 0x4;  // Read
 
+pub struct LoadedImage {
+    pagetable: &'static mut pgtable::PageTable,
+    user_stack: usize,
+    entry: usize,
+    image_base: usize,
+    image_size: usize,
+}
+
 /// 验证ELF头
 fn elf_verify(ehdr: &Elf64Ehdr, size: usize) -> bool {
     if size < core::mem::size_of::<Elf64Ehdr>() { return false; }
@@ -153,11 +161,15 @@ fn elf_load(
     Ok((entry, image_start, image_end - image_start))
 }
 
-/// exec 系统调用实现
-pub fn exec(filename: &str, tf: &mut TrapFrame) -> Result<(), ()> {
+/// 从 initrd 创建一个完整、但尚未注册到调度器的用户地址空间。
+fn load(filename: &str) -> Result<LoadedImage, ()> {
     let elf_data = crate::kernel::initrd::find(filename).ok_or_else(|| {
         println!("exec: file '{}' not found", filename);
     })?;
+    if elf_data.len() < core::mem::size_of::<Elf64Ehdr>() {
+        println!("exec: invalid ELF file '{}'", filename);
+        return Err(());
+    }
     let ehdr = unsafe { (elf_data.as_ptr() as *const Elf64Ehdr).read_unaligned() };
     if !elf_verify(&ehdr, elf_data.len()) {
         println!("exec: invalid ELF file '{}'", filename);
@@ -176,9 +188,41 @@ pub fn exec(filename: &str, tf: &mut TrapFrame) -> Result<(), ()> {
         PAGE_SIZE,
         PTE_R | PTE_W | PTE_U,
     )?;
-    crate::kernel::task::replace_current(
-        pagetable, user_stack, entry, image_base, image_size, tf,
+    Ok(LoadedImage {
+        pagetable,
+        user_stack,
+        entry,
+        image_base,
+        image_size,
+    })
+}
+
+/// 从 initrd 加载 ELF 并创建一个新的用户进程。
+pub fn spawn(filename: &str) -> Result<u32, ()> {
+    let image = load(filename)?;
+    let entry = image.entry;
+    let pid = crate::kernel::task::create_user_image(
+        image.pagetable,
+        image.user_stack,
+        image.entry,
+        image.image_base,
+        image.image_size,
     )?;
-    println!("exec: loaded '{}' entry=0x{:x}", filename, entry);
+    println!("spawn: loaded '{}' pid={} entry=0x{:x}", filename, pid, entry);
+    Ok(pid)
+}
+
+/// exec 系统调用实现
+pub fn exec(filename: &str, tf: &mut TrapFrame) -> Result<(), ()> {
+    let image = load(filename)?;
+    crate::kernel::task::replace_current(
+        image.pagetable,
+        image.user_stack,
+        image.entry,
+        image.image_base,
+        image.image_size,
+        tf,
+    )?;
+    println!("exec: loaded '{}' entry=0x{:x}", filename, image.entry);
     Ok(())
 }

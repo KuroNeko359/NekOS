@@ -5,9 +5,9 @@ use crate::drivers::uart;
 use crate::println;
 
 /// 系统调用号
-pub const SYS_WRITE: usize = 1;
+//pub const SYS_WRITE: usize = 1;
 pub const SYS_EXIT: usize = 2;
-pub const SYS_READ: usize = 3;
+//pub const SYS_READ: usize = 3;
 pub const SYS_YIELD: usize = 4;
 pub const SYS_GETPID: usize = 5;
 pub const SYS_FORK: usize = 6;
@@ -22,17 +22,17 @@ pub const SYS_IRQ_WAIT: usize = 13;
 /// 系统调用处理
 pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
     let syscall_num = tf.a7;
-    if syscall_num == SYS_READ && !uart::has_data() {
-        return crate::kernel::task::schedule(tf);
-    }
+    // if syscall_num == SYS_READ && !uart::has_data() {
+    //     return crate::kernel::task::schedule(tf);
+    // }
     tf.sepc += 4;
     match syscall_num {
-        SYS_WRITE => {
-            tf.a0 = sys_write(tf.a0, tf.a1, tf.a2);
-        }
-        SYS_READ => {
-            tf.a0 = sys_read(tf.a0, tf.a1, tf.a2);
-        }
+        // SYS_WRITE => {
+        //     tf.a0 = sys_write(tf.a0, tf.a1, tf.a2);
+        // }
+        // SYS_READ => {
+        //     tf.a0 = sys_read(tf.a0, tf.a1, tf.a2);
+        // }
         SYS_EXIT => {
             return sys_exit(tf.a0 as i32);
         }
@@ -107,7 +107,8 @@ pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
     tf as *mut TrapFrame
 }
 
-/// 写入系统调用
+
+#[deprecated]
 fn sys_write(fd: usize, buf: usize, len: usize) -> usize {
     if fd != 1 && fd != 2 {
         return !0usize;  // -1
@@ -127,7 +128,8 @@ fn sys_write(fd: usize, buf: usize, len: usize) -> usize {
     len
 }
 
-/// 读取系统调用
+
+#[deprecated]
 fn sys_read(fd: usize, buf: usize, len: usize) -> usize {
     if fd != 0 {
         return !0usize;  // -1
@@ -144,7 +146,9 @@ fn sys_read(fd: usize, buf: usize, len: usize) -> usize {
             Some(c) => c,
             None => {
                 // 没有数据，让出CPU
-                // TODO: 实现正确的阻塞
+                unsafe {
+                    core::arch::asm!("wfi", options(nomem, nostack));
+                }
                 continue;
             }
         };

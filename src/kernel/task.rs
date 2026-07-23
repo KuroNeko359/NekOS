@@ -9,13 +9,6 @@ use crate::kernel::ipc::{Endpoint, IpcResult, Message, MAX_ENDPOINTS};
 use crate::println;
 use spin::Mutex;
 
-extern "C" {
-    static __text_start: u8;
-    static __text_end: u8;
-    static __rodata_start: u8;
-    static __rodata_end: u8;
-}
-
 const MAX_TASKS: usize = 16;
 
 /// 进程状态
@@ -48,7 +41,6 @@ pub struct Task {
     pub exit_code: i32,
     pub image_base: usize,
     pub image_size: usize,
-    pub builtin_image: bool,
     pub parent_pid: Option<u32>,
     pub waiting_for: Option<WaitChannel>,
 }
@@ -84,21 +76,20 @@ impl TaskManager {
         user_stack: usize,
         image_base: usize,
         image_size: usize,
-        builtin_image: bool,
     ) {
-        if !builtin_image {
-            let start = image_base & !(PAGE_SIZE - 1);
-            let end = (image_base + image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            for va in (start..end).step_by(PAGE_SIZE) {
-                if let Some(pte) = pgtable::walk(pagetable, va, false) {
-                    if (*pte & PTE_V) != 0 {
-                        crate::kernel::page::free(pgtable::pte_to_pa(*pte));
-                        *pte = 0;
-                    }
+        let start = image_base & !(PAGE_SIZE - 1);
+        let end = (image_base + image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        for va in (start..end).step_by(PAGE_SIZE) {
+            if let Some(pte) = pgtable::walk(pagetable, va, false) {
+                if (*pte & PTE_V) != 0 {
+                    crate::kernel::page::free(pgtable::pte_to_pa(*pte));
+                    *pte = 0;
                 }
             }
         }
-        crate::kernel::page::free(user_stack);
+        if user_stack != 0 {
+            crate::kernel::page::free(user_stack);
+        }
         pgtable::free(pagetable);
     }
 
@@ -108,7 +99,6 @@ impl TaskManager {
             task.user_stack,
             task.image_base,
             task.image_size,
-            task.builtin_image,
         );
     }
 
@@ -131,18 +121,6 @@ impl TaskManager {
                 Self::free_task(task);
             }
         }
-    }
-
-    fn map_builtin(pagetable: &mut pgtable::PageTable) -> Result<(), ()> {
-        let text_start = unsafe { &__text_start as *const u8 as usize } & !(PAGE_SIZE - 1);
-        let text_end = (unsafe { &__text_end as *const u8 as usize } + PAGE_SIZE - 1)
-            & !(PAGE_SIZE - 1);
-        pgtable::set_flags(pagetable, text_start, text_end - text_start, PTE_R | PTE_X | PTE_U)?;
-
-        let rodata_start = unsafe { &__rodata_start as *const u8 as usize } & !(PAGE_SIZE - 1);
-        let rodata_end = (unsafe { &__rodata_end as *const u8 as usize } + PAGE_SIZE - 1)
-            & !(PAGE_SIZE - 1);
-        pgtable::set_flags(pagetable, rodata_start, rodata_end - rodata_start, PTE_R | PTE_U)
     }
 
     fn init_context(
@@ -208,7 +186,6 @@ impl TaskManager {
             exit_code: 0,
             image_base: 0,
             image_size: 0,
-            builtin_image: true,
             parent_pid: None,
             waiting_for: None,
         };
@@ -217,43 +194,35 @@ impl TaskManager {
         Ok(Self::IDLE_PID)
     }
     
-    /// 创建新的用户进程
-    pub fn create_user(
+    /// 接管已经加载好的 ELF 地址空间并创建用户进程。
+    pub fn create_user_image(
         &mut self,
-        image_start: usize,
-        image_end: usize,
+        pagetable: &'static mut pgtable::PageTable,
+        user_stack: usize,
         entry: usize,
+        image_base: usize,
+        image_size: usize,
     ) -> Result<u32, ()> {
-        // 分配内核栈
-        let kernel_stack = crate::kernel::page::alloc().ok_or(())?;
-        
-        // 分配用户栈
-        let user_stack = crate::kernel::page::alloc().ok_or(())?;
-        
-        // 创建页表
-        let pagetable = pgtable::create().ok_or(())?;
-        
-        vm::map_kernel(pagetable)?;
-        Self::map_builtin(pagetable)?;
+        let slot_index = match self.tasks.iter().position(|slot| slot.is_none()) {
+            Some(index) => index,
+            None => {
+                Self::free_user_space(pagetable, user_stack, image_base, image_size);
+                return Err(());
+            }
+        };
+        let kernel_stack = match crate::kernel::page::alloc() {
+            Some(stack) => stack,
+            None => {
+                Self::free_user_space(pagetable, user_stack, image_base, image_size);
+                return Err(());
+            }
+        };
 
-        let user_entry = entry;
-        
-        // 映射用户栈
-        pgtable::map(
-            pagetable,
-            USER_STACK_TOP - PAGE_SIZE,
-            user_stack,
-            PAGE_SIZE,
-            PTE_R | PTE_W | PTE_U,
-        )?;
-        
-        // 创建进程
         let pid = self.next_pid;
         self.next_pid += 1;
-        
         let mut initial_frame = TrapFrame::new();
         initial_frame.sp = USER_STACK_TOP;
-        initial_frame.sepc = user_entry;
+        initial_frame.sepc = entry;
         initial_frame.sstatus = SSTATUS_SPIE | SSTATUS_SUM;
         let trap_frame = Self::init_context(kernel_stack, pagetable, &initial_frame);
 
@@ -263,23 +232,21 @@ impl TaskManager {
             trap_frame,
             kernel_stack,
             user_stack,
-            entry: user_entry,
+            entry,
             pagetable,
             exit_code: 0,
-            image_base: image_start,
-            image_size: image_end - image_start,
-            builtin_image: true,
+            image_base,
+            image_size,
             parent_pid: self.current_pid,
             waiting_for: None,
         };
-        
-        let slot = self.tasks.iter_mut().find(|slot| slot.is_none()).ok_or(())?;
-        *slot = Some(task);
+
+        self.tasks[slot_index] = Some(task);
         self.runnable_count += 1;
-        
-        println!("task create user: pid={} entry=0x{:x} user_sp=0x{:x}", 
-                 pid, user_entry, USER_STACK_TOP);
-        
+
+        println!("task create user: pid={} entry=0x{:x} user_sp=0x{:x}",
+                 pid, entry, USER_STACK_TOP);
+
         Ok(pid)
     }
     
@@ -358,9 +325,9 @@ impl TaskManager {
         let parent_index = self.tasks.iter().position(|slot| {
             slot.as_ref().is_some_and(|task| Some(task.pid) == self.current_pid)
         }).ok_or(())?;
-        let (builtin, image_base, image_size, entry, parent_stack, parent_pt) = {
+        let (image_base, image_size, entry, parent_stack, parent_pt) = {
             let parent = self.tasks[parent_index].as_mut().ok_or(())?;
-            (parent.builtin_image, parent.image_base, parent.image_size, parent.entry,
+            (parent.image_base, parent.image_size, parent.entry,
              parent.user_stack, parent.pagetable as *mut pgtable::PageTable)
         };
 
@@ -368,25 +335,21 @@ impl TaskManager {
         let child_user_stack = crate::kernel::page::alloc().ok_or(())?;
         let child_pt = pgtable::create().ok_or(())?;
         vm::map_kernel(child_pt)?;
-        if builtin {
-            Self::map_builtin(child_pt)?;
-        } else {
-            let start = image_base & !(PAGE_SIZE - 1);
-            let end = (image_base + image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-            for va in (start..end).step_by(PAGE_SIZE) {
-                let source_pte = pgtable::walk(unsafe { &mut *parent_pt }, va, false)
-                    .map(|pte| *pte).filter(|pte| pte & PTE_V != 0);
-                let Some(source_pte) = source_pte else { continue };
-                let page = crate::kernel::page::alloc().ok_or(())?;
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        pgtable::pte_to_pa(source_pte) as *const u8,
-                        page as *mut u8,
-                        PAGE_SIZE,
-                    );
-                }
-                pgtable::map(child_pt, va, page, PAGE_SIZE, source_pte & 0x3fe)?;
+        let start = image_base & !(PAGE_SIZE - 1);
+        let end = (image_base + image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        for va in (start..end).step_by(PAGE_SIZE) {
+            let source_pte = pgtable::walk(unsafe { &mut *parent_pt }, va, false)
+                .map(|pte| *pte).filter(|pte| pte & PTE_V != 0);
+            let Some(source_pte) = source_pte else { continue };
+            let page = crate::kernel::page::alloc().ok_or(())?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pgtable::pte_to_pa(source_pte) as *const u8,
+                    page as *mut u8,
+                    PAGE_SIZE,
+                );
             }
+            pgtable::map(child_pt, va, page, PAGE_SIZE, source_pte & 0x3fe)?;
         }
         unsafe {
             core::ptr::copy_nonoverlapping(
@@ -419,7 +382,6 @@ impl TaskManager {
             exit_code: 0,
             image_base,
             image_size,
-            builtin_image: builtin,
             parent_pid: self.current_pid,
             waiting_for: None,
         };
@@ -442,7 +404,7 @@ impl TaskManager {
     ) -> Result<(), ()> {
         let user_satp = (8usize << 60)
             | ((pagetable as *const pgtable::PageTable as usize) >> PAGE_SHIFT);
-        let (old_pagetable, old_user_stack, old_image_base, old_image_size, old_builtin) = {
+        let (old_pagetable, old_user_stack, old_image_base, old_image_size) = {
             let current = self.current_mut().ok_or(())?;
             let old_pagetable = core::mem::replace(&mut current.pagetable, pagetable);
             let old = (
@@ -450,13 +412,11 @@ impl TaskManager {
                 current.user_stack,
                 current.image_base,
                 current.image_size,
-                current.builtin_image,
             );
             current.user_stack = user_stack;
             current.entry = entry;
             current.image_base = image_base;
             current.image_size = image_size;
-            current.builtin_image = false;
             unsafe {
                 ((current.trap_frame + core::mem::size_of::<TrapFrame>() + 8) as *mut usize)
                     .write(user_satp);
@@ -473,7 +433,6 @@ impl TaskManager {
             old_user_stack,
             old_image_base,
             old_image_size,
-            old_builtin,
         );
         Ok(())
     }
@@ -731,9 +690,21 @@ pub fn init() {
     *TASK_MANAGER.lock() = Some(TaskManager::new());
 }
 
-/// 创建用户进程
-pub fn create_user(image_start: usize, image_end: usize, entry: usize) -> Result<u32, ()> {
-    TASK_MANAGER.lock().as_mut().ok_or(())?.create_user(image_start, image_end, entry)
+/// 接管 ELF 加载器创建的地址空间并注册用户进程。
+pub fn create_user_image(
+    pagetable: &'static mut pgtable::PageTable,
+    user_stack: usize,
+    entry: usize,
+    image_base: usize,
+    image_size: usize,
+) -> Result<u32, ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.create_user_image(
+        pagetable,
+        user_stack,
+        entry,
+        image_base,
+        image_size,
+    )
 }
 
 /// 创建固定 PID 0 的内核态 idle 任务。
@@ -786,6 +757,36 @@ pub fn task_satp(pid: u32) -> Option<usize> {
                         | ((task.pagetable as *const pgtable::PageTable as usize) >> PAGE_SHIFT)
                 })
         })
+}
+
+/// 将指定的已注册用户任务作为第一个任务启动。
+///
+/// 后续上下文切换统一由 trap 返回路径完成。
+pub unsafe fn enter_task(pid: u32) -> ! {
+    let (entry, kernel_stack_top, user_satp) = {
+        let mut guard = TASK_MANAGER.lock();
+        let manager = guard.as_mut().expect("task manager not initialized");
+        let task = manager.tasks.iter_mut().flatten()
+            .find(|task| task.pid == pid)
+            .expect("task not found");
+        task.state = TaskState::Running;
+        manager.current_pid = Some(pid);
+        (
+            task.entry,
+            task.kernel_stack + PAGE_SIZE,
+            (8usize << 60)
+                | ((task.pagetable as *const pgtable::PageTable as usize) >> PAGE_SHIFT),
+        )
+    };
+
+    enter_user(
+        USER_STACK_TOP,
+        entry,
+        kernel_stack_top - 16,
+        vm::kernel_satp(),
+        user_satp,
+    );
+    core::hint::unreachable_unchecked()
 }
 
 /// 调度下一个进程

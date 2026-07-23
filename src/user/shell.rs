@@ -2,6 +2,8 @@
 
 use core::fmt;
 
+use crate::user::io;
+
 macro_rules! print {
     ($($arg:tt)*) => {
         print_fmt(format_args!($($arg)*));
@@ -22,10 +24,11 @@ struct UserWriter;
 
 impl fmt::Write for UserWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            console_call(1, byte as usize);
+        if io::write(1, s.as_bytes()) == s.len() as isize {
+            Ok(())
+        } else {
+            Err(fmt::Error)
         }
-        Ok(())
     }
 }
 
@@ -81,7 +84,7 @@ pub extern "C" fn user_main() {
                 println!("  - Sv39 virtual memory");
                 println!("  - Preemptive scheduling (timer interrupt)");
                 println!("  - User mode (U-mode) processes");
-                println!("  - Microkernel architecture (planned)");
+                println!("  - User-mode Console Server over IPC");
             }
             "pid" => {
                 let pid = syscall_getpid();
@@ -159,7 +162,11 @@ pub extern "C" fn user_main() {
 fn read_line(buf: &mut [u8]) -> usize {
     let mut len = 0usize;
     while len + 1 < buf.len() {
-        let byte = console_call(2, 0) as u8;
+        let mut input = [0u8; 1];
+        if io::read(0, &mut input) != 1 {
+            return len;
+        }
+        let byte = input[0];
         if byte == 0x7f || byte == 8 {
             if len > 0 {
                 len -= 1;
@@ -167,19 +174,15 @@ fn read_line(buf: &mut [u8]) -> usize {
             }
             continue;
         }
-        console_call(1, byte as usize);
+        if io::write(1, &[byte]) != 1 {
+            return len;
+        }
         if byte == b'\n' { break; }
         buf[len] = byte;
         len += 1;
     }
     buf[len] = 0;
     len
-}
-
-fn console_call(operation: usize, argument: usize) -> usize {
-    crate::user::ipc::call(1, [operation, argument, 0, 0])
-        .map(|reply| reply[0])
-        .unwrap_or(usize::MAX)
 }
 
 /// 系统调用：获取PID
