@@ -75,13 +75,11 @@ impl Uart {
     /// 接收字符
     pub fn getc(&self) -> Option<u8> {
         unsafe {
-            // 检查是否有数据
-            if (self.read_reg(LSR) & 0x01) != 0 {
-                Some(self.read_reg(RBR))
-            } else {
-                None
+            if self.has_data() {
+                return Some(self.read_reg(RBR));
             }
         }
+        None
     }
     
     /// 检查是否有数据
@@ -168,4 +166,3 @@ macro_rules! println {
         $crate::printk!("\n");
     };
 }
-

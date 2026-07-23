@@ -70,6 +70,7 @@ pub struct TaskManager {
     /// 可运行进程数
     runnable_count: u32,
     endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
+    uart_owner: Option<u32>,
 }
 
 /// 全局进程管理器
@@ -168,6 +169,7 @@ impl TaskManager {
             next_pid: 1,
             runnable_count: 0,
             endpoints: [None; MAX_ENDPOINTS],
+            uart_owner: None,
         }
     }
 
@@ -847,13 +849,18 @@ pub fn ipc_reply(client: u32, words: [usize; 4]) -> Result<(), ()> {
 pub fn grant_uart(pid: u32) -> Result<(), ()> {
     let mut guard = TASK_MANAGER.lock();
     let manager = guard.as_mut().ok_or(())?;
+    if manager.uart_owner.is_some() {
+        return Err(());
+    }
     let task = manager.tasks.iter_mut().flatten().find(|task| task.pid == pid).ok_or(())?;
     pgtable::set_flags(
         task.pagetable,
         0x1000_0000,
         PAGE_SIZE,
         PTE_R | PTE_W | PTE_U,
-    )
+    )?;
+    manager.uart_owner = Some(pid);
+    Ok(())
 }
 
 pub fn replace_current(
@@ -880,9 +887,13 @@ pub fn list_all() {
     TASK_MANAGER.lock().as_ref().unwrap().list_all();
 }
 
-pub fn sleep_uart(tf: &TrapFrame) -> *mut TrapFrame {
+pub fn wait_uart_irq(tf: &TrapFrame) -> Result<*mut TrapFrame, ()> {
     let mut guard = TASK_MANAGER.lock();
-    let manager = guard.as_mut().unwrap();
+    let manager = guard.as_mut().ok_or(())?;
+
+    if manager.current_pid == Some(0) || manager.current_pid != manager.uart_owner {
+        return Err(());
+    }
 
     if let Some(current) = manager.current_mut() {
         current.state = TaskState::Sleeping;
@@ -894,14 +905,20 @@ pub fn sleep_uart(tf: &TrapFrame) -> *mut TrapFrame {
 
         manager.runnable_count =
             manager.runnable_count.saturating_sub(1);
+    } else {
+        return Err(());
     }
 
-    manager.schedule(tf) as *mut TrapFrame
+    // 单核上系统调用处理期间 S-mode 中断关闭。先使能 IRQ 再切走，
+    // 即使字符已在检查和 ecall 之间到达，PLIC 的电平中断也不会丢失。
+    crate::drivers::plic::enable(crate::drivers::plic::UART0_IRQ);
+    Ok(manager.schedule(tf) as *mut TrapFrame)
 }
 
-pub fn wake_uart() {
+pub fn wake_uart() -> bool {
     let mut guard = TASK_MANAGER.lock();
-    let manager = guard.as_mut().unwrap();
+    let Some(manager) = guard.as_mut() else { return false };
+    let mut woke = false;
 
     for task in manager.tasks.iter_mut().flatten() {
         if task.state == TaskState::Sleeping
@@ -909,9 +926,14 @@ pub fn wake_uart() {
         {
             task.state = TaskState::Ready;
             task.waiting_for = None;
+            unsafe {
+                (*(task.trap_frame as *mut TrapFrame)).a0 = 0;
+            }
             manager.runnable_count += 1;
+            woke = true;
         }
     }
+    woke
 }
 
 /// 外部汇编函数

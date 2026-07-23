@@ -25,11 +25,27 @@ fn putc(byte: u8) {
 }
 
 fn getc() -> u8 {
-    unsafe {
-        while read_reg(LSR) & 0x01 == 0 {
-            core::hint::spin_loop();
+    loop {
+        unsafe {
+            if read_reg(LSR) & 0x01 != 0 {
+                return read_reg(RBR);
+            }
         }
-        read_reg(RBR)
+        irq_wait();
+    }
+}
+
+fn irq_wait() {
+    let mut result = 10usize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") result,
+            in("a7") 13usize,
+        );
+    }
+    if result == usize::MAX {
+        panic!("console irq_wait failed");
     }
 }
 

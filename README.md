@@ -8,6 +8,7 @@
 - **进程管理**: 支持用户态进程创建和调度
 - **同步 IPC**: endpoint、call、recv、reply
 - **用户态服务**: Console Server 独占 UART MMIO，Shell 通过 IPC 访问终端
+- **中断驱动输入**: Console Server 通过 irq_wait 阻塞，UART RX 中断到达后由内核唤醒
 - **进程生命周期**: fork、exec、waitpid、Zombie 回收
 - **陷阱处理**: 支持中断和异常处理
 - **定时器**: 基于 SBI 的定时器中断
@@ -63,13 +64,16 @@ riscv-os-rust/
 │   │   ├── task.rs     # 进程管理
 │   │   ├── syscall.rs  # 系统调用
 │   │   ├── ipc.rs      # 同步 IPC 与 endpoint ABI
+│   │   ├── idle.rs     # PID 0 内核 idle 任务
 │   │   ├── exec.rs     # exec 实现
 │   │   └── timer.rs    # 定时器
 │   ├── drivers/
 │   │   ├── mod.rs      # 驱动模块
+│   │   ├── plic.rs     # PLIC 外部中断控制器
 │   │   └── uart.rs     # UART 驱动
 │   └── user/
 │       ├── mod.rs      # 用户模块
+│       ├── ipc.rs      # 用户态 IPC 系统调用封装
 │       ├── console.rs  # 用户态 Console Server
 │       └── shell.rs    # 用户 Shell
 └── README.md
@@ -91,11 +95,14 @@ riscv-os-rust/
 | 10 | ipc_call | 发送请求并等待回复 |
 | 11 | ipc_recv | 服务端接收请求 |
 | 12 | ipc_reply | 服务端回复客户端 |
+| 13 | irq_wait | 设备服务等待已授权的硬件中断 |
 
 ## 微内核边界
 
 内核负责地址空间、任务调度、陷阱、定时器和 IPC endpoint。Console Server 运行在 U-mode，
 是唯一获得 UART MMIO 用户映射的任务；Shell 不直接访问 UART，而是通过 endpoint 1 同步调用服务。
+Console 等待输入时调用 `irq_wait` 进入 Sleeping，UART RX 中断将其唤醒；没有普通任务可运行时
+PID 0 执行 `wfi`。
 `read/write` 系统调用目前仅作为 initrd 旧程序的兼容接口保留，后续服务全部迁移后可删除。
 
 ## 许可证

@@ -17,6 +17,7 @@ pub const SYS_WAITPID: usize = 9;
 pub const SYS_IPC_CALL: usize = 10;
 pub const SYS_IPC_RECV: usize = 11;
 pub const SYS_IPC_REPLY: usize = 12;
+pub const SYS_IRQ_WAIT: usize = 13;
 
 /// 系统调用处理
 pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
@@ -87,6 +88,16 @@ pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
                 [tf.a1, tf.a2, tf.a3, tf.a4],
             );
             tf.a0 = if result.is_ok() { 0 } else { usize::MAX };
+        }
+        SYS_IRQ_WAIT => {
+            if tf.a0 != crate::drivers::plic::UART0_IRQ as usize {
+                tf.a0 = usize::MAX;
+            } else {
+                match crate::kernel::task::wait_uart_irq(tf) {
+                    Ok(next) => return next,
+                    Err(()) => tf.a0 = usize::MAX,
+                }
+            }
         }
         _ => {
             println!("unknown syscall: {}", syscall_num);

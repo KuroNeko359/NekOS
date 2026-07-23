@@ -36,6 +36,8 @@ pub fn init() {
             PAGE_SIZE,
             PTE_R | PTE_W,
         ).expect("Failed to map UART");
+
+        map_plic(pt).expect("Failed to map PLIC");
         
         // 设置SATP寄存器
         let satp = (8usize << 60) | ((pt as *mut pgtable::PageTable as usize) >> PAGE_SHIFT);
@@ -70,7 +72,17 @@ pub fn map_kernel(pt: &mut pgtable::PageTable) -> Result<(), ()> {
         PAGE_SIZE,
         PTE_R | PTE_W,
     )?;
+
+    map_plic(pt)?;
     
+    Ok(())
+}
+
+/// PLIC 的 priority、hart 0 S-mode enable 和 context 寄存器位于不同页面。
+fn map_plic(pt: &mut pgtable::PageTable) -> Result<(), ()> {
+    for address in [0x0c00_0000, 0x0c00_2000, 0x0c20_1000] {
+        pgtable::map(pt, address, address, PAGE_SIZE, PTE_R | PTE_W)?;
+    }
     Ok(())
 }
 

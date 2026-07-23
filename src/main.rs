@@ -27,6 +27,8 @@ pub extern "C" fn kernel_main() -> ! {
     
     kernel::vm::init();
 
+    drivers::plic::init();
+
     // 初始化内嵌用户程序归档
     kernel::initrd::init();
     

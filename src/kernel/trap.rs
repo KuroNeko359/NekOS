@@ -134,9 +134,19 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             return crate::kernel::task::schedule(tf);
         }
         TrapCause::External => {
-            // 外部中断
-            // TODO: 处理外部中断
-            println!("external interrupt");
+            let irq = crate::drivers::plic::claim();
+            if irq == crate::drivers::plic::UART0_IRQ {
+                // UART RX 是电平中断。先屏蔽，待 Console 再次 irq_wait 时重开，
+                // 避免它读取 RBR 前不断重新触发。
+                crate::drivers::plic::disable(irq);
+                crate::kernel::task::wake_uart();
+            } else if irq != 0 {
+                println!("unhandled external irq {}", irq);
+            }
+            if irq != 0 {
+                crate::drivers::plic::complete(irq);
+            }
+            return crate::kernel::task::schedule(tf);
         }
         TrapCause::InstructionPageFault => {
             println!("instruction page fault at 0x{:x}, sepc=0x{:x}", stval, tf.sepc);
@@ -155,7 +165,6 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             panic!("unknown trap");
         }
     }
-    tf as *mut TrapFrame
 }
 
 /// 外部汇编函数
