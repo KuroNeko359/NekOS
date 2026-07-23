@@ -50,8 +50,8 @@ nekos/
 ├── user/
 │   ├── Cargo.toml      # 用户程序 Cargo workspace
 │   ├── userlib/        # 用户态入口、系统调用、IPC 和打印库
-│   ├── include/nekos.h  # C 用户程序 API
-│   ├── libc/           # C 启动入口与最小运行库
+│   ├── include/        # nekos 原生 API 与 POSIX 兼容头文件
+│   ├── libc/           # C 启动入口、原生接口与 POSIX 包装
 │   └── programs/
 │       ├── console/    # Console Server
 │       ├── shell/      # Shell
@@ -116,11 +116,11 @@ cargo build --manifest-path user/Cargo.toml --release
 在 `user/programs/程序名/src/main.c` 中编写程序：
 
 ```c
-#include <nekos.h>
+#include <unistd.h>
 
 int main(void) {
     static const char message[] = "Hello from C!\n";
-    nekos_write(1, message, sizeof(message) - 1);
+    write(1, message, sizeof(message) - 1);
     return 0;
 }
 ```
@@ -136,6 +136,25 @@ C API 在 `user/include/nekos.h` 中，目前包括：
 - `nekos_fork`、`nekos_exec`、`nekos_waitpid`、`nekos_ps`
 - `nekos_ipc_call`、`nekos_ipc_recv`、`nekos_ipc_reply`
 - `nekos_read`、`nekos_write`、`nekos_irq_wait`
+
+普通程序优先使用 POSIX 风格接口：
+
+- `<unistd.h>`：`read`、`write`、`_exit`、`getpid`、`fork`、`execve`
+- `<sys/wait.h>`：`waitpid`、`WIFEXITED`、`WEXITSTATUS`
+- `<stdlib.h>`：`exit`、`_Exit`
+- `<stdio.h>`：`putchar`、`puts`、最小 `printf`
+- `<errno.h>`：`errno` 和当前支持的错误码
+
+这些函数由 `user/libc/posix.c` 转发到 `nekos_*` 原生接口。IPC endpoint
+和 IRQ 等微内核特有功能没有 POSIX 对应物，仍通过 `<nekos.h>` 使用。
+
+当前只是 POSIX 子集：`execve` 尚不传递 `argv/envp`；`waitpid` 只支持
+等待指定的正 PID 和 `options == 0`；`exit` 尚未实现 stdio 刷新与
+`atexit` 回调。
+
+当前 `printf` 支持 `%c`、`%s`、`%d`、`%u`、`%x`、`%ld`、`%lu`、
+`%lx`、`%p` 和 `%%`，输出最终通过 `write(1, ...)` 发送给 Console
+Server，不直接访问 UART。
 
 同一程序目录如果同时存在 `src/main.rs` 和 `src/main.c`，构建脚本优先编译
 Rust 文件。
