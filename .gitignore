@@ -1,5 +1,6 @@
 # Rust / Cargo build output
 /target/
+/user/target/
 /build/
 
 # Generated kernel and initrd artifacts

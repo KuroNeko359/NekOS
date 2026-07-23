@@ -1,8 +1,11 @@
-//! 用户态同步 IPC 系统调用封装。
+//! nekos 用户态同步 IPC 接口。
 
-pub const IPC_ERROR: usize = usize::MAX;
+const SYS_IPC_CALL: usize = 10;
+const SYS_IPC_RECV: usize = 11;
+const SYS_IPC_REPLY: usize = 12;
 
-/// 向端点发送四个机器字，并阻塞到服务端回复。
+pub const ERROR: usize = usize::MAX;
+
 pub fn call(endpoint: usize, words: [usize; 4]) -> Result<[usize; 4], ()> {
     let mut a0 = endpoint;
     let mut a1 = words[0];
@@ -16,13 +19,12 @@ pub fn call(endpoint: usize, words: [usize; 4]) -> Result<[usize; 4], ()> {
             inlateout("a2") a2,
             inlateout("a3") a3,
             in("a4") words[3],
-            in("a7") 10usize,
+            in("a7") SYS_IPC_CALL,
         );
     }
-    if a0 == IPC_ERROR { Err(()) } else { Ok([a0, a1, a2, a3]) }
+    if a0 == ERROR { Err(()) } else { Ok([a0, a1, a2, a3]) }
 }
 
-/// 接收发往端点的请求；没有请求时阻塞。
 pub fn recv(endpoint: usize) -> Result<(u32, [usize; 4]), ()> {
     let mut a0 = endpoint;
     let a1: usize;
@@ -37,17 +39,16 @@ pub fn recv(endpoint: usize) -> Result<(u32, [usize; 4]), ()> {
             lateout("a2") a2,
             lateout("a3") a3,
             lateout("a4") a4,
-            in("a7") 11usize,
+            in("a7") SYS_IPC_RECV,
         );
     }
-    if a0 == IPC_ERROR {
+    if a0 == ERROR {
         Err(())
     } else {
         Ok((a0 as u32, [a1, a2, a3, a4]))
     }
 }
 
-/// 回复一个因 `call` 阻塞的客户端。
 pub fn reply(client: u32, words: [usize; 4]) -> Result<(), ()> {
     let mut result = client as usize;
     unsafe {
@@ -58,7 +59,7 @@ pub fn reply(client: u32, words: [usize; 4]) -> Result<(), ()> {
             in("a2") words[1],
             in("a3") words[2],
             in("a4") words[3],
-            in("a7") 12usize,
+            in("a7") SYS_IPC_REPLY,
         );
     }
     if result == 0 { Ok(()) } else { Err(()) }

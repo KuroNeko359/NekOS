@@ -1,4 +1,4 @@
-# KuroOS Rust - RISC-V 微内核操作系统
+# nekos - RISC-V 微内核操作系统
 
 用 Rust 编写的 RISC-V 64 位微内核操作系统。
 
@@ -40,16 +40,24 @@ make debug
 ## 项目结构
 
 ```
-riscv-os-rust/
+nekos/
 ├── Cargo.toml          # Cargo 配置
 ├── Makefile            # 构建脚本
 ├── linker.ld           # 链接脚本
 ├── build.rs            # 构建脚本
 ├── programs/
-│   ├── console.rs      # 独立 Console Server ELF 入口
-│   ├── shell.rs        # 独立 Shell ELF 入口
-│   ├── hello.S         # exec 测试程序
 │   └── user.ld         # 用户 ELF 链接脚本
+├── user/
+│   ├── Cargo.toml      # 用户程序 Cargo workspace
+│   ├── userlib/        # 用户态入口、系统调用、IPC 和打印库
+│   ├── include/nekos.h  # C 用户程序 API
+│   ├── libc/           # C 启动入口与最小运行库
+│   └── programs/
+│       ├── console/    # Console Server
+│       ├── shell/      # Shell
+│       ├── hello/      # Rust hello
+│       ├── hello-c/    # C hello
+│       └── test/       # 最小测试程序
 ├── src/
 │   ├── main.rs         # 内核入口点
 │   ├── arch/
@@ -76,13 +84,61 @@ riscv-os-rust/
 │   │   ├── mod.rs      # 驱动模块
 │   │   ├── plic.rs     # PLIC 外部中断控制器
 │   │   └── uart.rs     # UART 驱动
-│   └── user/
-│       ├── io.rs       # 用户态 read/write 接口
-│       ├── ipc.rs      # 用户态 IPC 系统调用封装
-│       ├── console.rs  # 用户态 Console Server
-│       └── shell.rs    # 用户 Shell
 └── README.md
 ```
+
+## 编写用户程序
+
+用户程序通过 `userlib` 使用 nekos。最小程序如下：
+
+```rust
+#![no_std]
+#![no_main]
+
+use userlib::{entry, println};
+
+fn main() {
+    println!("hello from Rust");
+}
+
+entry!(main);
+```
+
+在 `user/programs/` 下新增一个包含 `Cargo.toml` 和 `src/main.rs` 的程序目录后，
+`make build` 会自动发现、编译并将它打包进 initrd。用户程序也可以单独检查：
+
+```bash
+cargo build --manifest-path user/Cargo.toml --release
+```
+
+### 编写 C 用户程序
+
+在 `user/programs/程序名/src/main.c` 中编写程序：
+
+```c
+#include <nekos.h>
+
+int main(void) {
+    static const char message[] = "Hello from C!\n";
+    nekos_write(1, message, sizeof(message) - 1);
+    return 0;
+}
+```
+
+执行 `make build` 时，构建脚本会自动识别 `src/main.c`，使用
+`riscv64-elf-gcc`、`libnekos` 和 `programs/user.ld` 生成 RISC-V ELF，
+然后将其加入 initrd。程序从 `main` 返回后，C 启动代码会自动调用
+`nekos_exit`。
+
+C API 在 `user/include/nekos.h` 中，目前包括：
+
+- `nekos_exit`、`nekos_yield`、`nekos_getpid`
+- `nekos_fork`、`nekos_exec`、`nekos_waitpid`、`nekos_ps`
+- `nekos_ipc_call`、`nekos_ipc_recv`、`nekos_ipc_reply`
+- `nekos_read`、`nekos_write`、`nekos_irq_wait`
+
+同一程序目录如果同时存在 `src/main.rs` 和 `src/main.c`，构建脚本优先编译
+Rust 文件。
 
 ## 系统调用
 

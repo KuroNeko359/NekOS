@@ -1,12 +1,12 @@
 [package]
-name = "riscv-os-rust"
+name = "nekos"
 version = "0.1.0"
 edition = "2021"
 authors = ["kuroneko359"]
-description = "A RISC-V microkernel operating system written in Rust"
+description = "nekos, a RISC-V microkernel operating system written in Rust"
 
 [[bin]]
-name = "riscv-os-rust"
+name = "nekos"
 path = "src/main.rs"
 test = false
 bench = false

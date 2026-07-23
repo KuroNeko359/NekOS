@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "userlib",
+    "programs/console",
+    "programs/shell",
+    "programs/hello",
+    "programs/test",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"

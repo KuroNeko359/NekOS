@@ -1,4 +1,4 @@
-# Makefile for RISC-V OS in Rust
+# Makefile for nekos
 
 TARGET = riscv64gc-unknown-none-elf
 MODE = release
@@ -6,14 +6,17 @@ CARGO = cargo
 CARGO_FLAGS = --target $(TARGET) --$(MODE) -Z build-std=core,alloc
 QEMU = qemu-system-riscv64
 QEMU_FLAGS = -machine virt -nographic -kernel
-KERNEL = target/$(TARGET)/$(MODE)/riscv-os-rust
+KERNEL = target/$(TARGET)/$(MODE)/nekos
 
-.PHONY: all build run debug clean
+.PHONY: all build user-build run debug clean
 
 all: build
 
 build:
 	RUSTC_BOOTSTRAP=1 $(CARGO) build $(CARGO_FLAGS)
+
+user-build:
+	RUSTC_BOOTSTRAP=1 $(CARGO) build --manifest-path user/Cargo.toml $(CARGO_FLAGS)
 
 run: build
 	$(QEMU) $(QEMU_FLAGS) $(KERNEL)

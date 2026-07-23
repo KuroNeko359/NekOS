@@ -14,8 +14,8 @@ pub extern "C" fn kernel_main() -> ! {
     // 初始化UART
     drivers::uart::init();
     
-    println!("Hello, RISC-V OS!");
-    println!("KuroOS Rust - Microkernel Operating System");
+    println!("Hello, nekos!");
+    println!("nekos - Microkernel Operating System");
     println!("kernel_main = 0x{:x}", kernel_main as usize);
 
     kernel::page::init();
