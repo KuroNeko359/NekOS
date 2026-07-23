@@ -22,7 +22,9 @@ struct UserWriter;
 
 impl fmt::Write for UserWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        syscall_write(1, s.as_ptr(), s.len());
+        for byte in s.bytes() {
+            console_call(1, byte as usize);
+        }
         Ok(())
     }
 }
@@ -155,37 +157,29 @@ pub extern "C" fn user_main() {
 
 /// 读取一行输入
 fn read_line(buf: &mut [u8]) -> usize {
-    syscall_read(0, buf.as_mut_ptr(), buf.len())
+    let mut len = 0usize;
+    while len + 1 < buf.len() {
+        let byte = console_call(2, 0) as u8;
+        if byte == 0x7f || byte == 8 {
+            if len > 0 {
+                len -= 1;
+                print!("\x08 \x08");
+            }
+            continue;
+        }
+        console_call(1, byte as usize);
+        if byte == b'\n' { break; }
+        buf[len] = byte;
+        len += 1;
+    }
+    buf[len] = 0;
+    len
 }
 
-/// 系统调用：写入
-fn syscall_write(fd: usize, buf: *const u8, len: usize) -> usize {
-    let result: usize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") fd => result,
-            in("a1") buf as usize,
-            in("a2") len,
-            in("a7") 1usize,
-        );
-    }
-    result
-}
-
-/// 系统调用：读取
-fn syscall_read(fd: usize, buf: *mut u8, len: usize) -> usize {
-    let result: usize;
-    unsafe {
-        core::arch::asm!(
-            "ecall",
-            inlateout("a0") fd => result,
-            in("a1") buf as usize,
-            in("a2") len,
-            in("a7") 3usize,
-        );
-    }
-    result
+fn console_call(operation: usize, argument: usize) -> usize {
+    crate::user::ipc::call(1, [operation, argument, 0, 0])
+        .map(|reply| reply[0])
+        .unwrap_or(usize::MAX)
 }
 
 /// 系统调用：获取PID

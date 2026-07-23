@@ -38,22 +38,35 @@ pub extern "C" fn kernel_main() -> ! {
     
     let image_start: usize = arch::riscv::KERNEL_ENTRY;
     let image_end = unsafe { &__kernel_end as *const u8 as usize };
+
+    // PID 0 是 S-mode idle，只在没有普通 Ready 任务时运行。
+    kernel::idle::create_idle().expect("Failed to create idle task");
+
+    let console_pid = kernel::task::create_user(
+        image_start,
+        image_end,
+        user::console::console_server_main as usize,
+    ).expect("Failed to create console server");
+    kernel::task::grant_uart(console_pid).expect("Failed to grant UART to console server");
+    kernel::ipc::register(kernel::ipc::CONSOLE_ENDPOINT, console_pid)
+        .expect("Failed to register console endpoint");
+
     let user_entry = user::shell::user_main as usize;
-    let pid = kernel::task::create_user(
+    let shell_pid = kernel::task::create_user(
         image_start,
         image_end,
         user_entry,
     ).expect("Failed to create user process");
     
-    println!("entering user mode: pid={}", pid);
-    
+    println!("microkernel: console_pid={} shell_pid={}", console_pid, shell_pid);
+
     // 进入用户模式
     unsafe {
         let kernel_satp = kernel::vm::kernel_satp();
-        kernel::task::set_current(pid);
-        let user_satp = kernel::task::task_satp(pid).expect("missing user page table");
+        kernel::task::set_current(shell_pid);
+        let user_satp = kernel::task::task_satp(shell_pid).expect("missing user page table");
         let user_sp = arch::riscv::USER_STACK_TOP;
-        let trap_stack = kernel::task::kernel_stack_top(pid).expect("missing kernel stack") - 16;
+        let trap_stack = kernel::task::kernel_stack_top(shell_pid).expect("missing kernel stack") - 16;
         
         kernel::task::enter_user(user_sp, user_entry, trap_stack, kernel_satp, user_satp);
     }

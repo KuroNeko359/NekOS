@@ -8,4 +8,6 @@ pub mod task;
 pub mod syscall;
 pub mod exec;
 pub mod initrd;
+pub mod ipc;
 pub mod timer;
+pub mod idle;

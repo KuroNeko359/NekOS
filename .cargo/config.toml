@@ -3,3 +3,6 @@ target = "riscv64gc-unknown-none-elf"
 
 [unstable]
 build-std = ["core", "alloc"]
+
+[env]
+RUSTC_BOOTSTRAP = "1"

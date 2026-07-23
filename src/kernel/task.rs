@@ -1,10 +1,11 @@
 //! 进程管理
 
 use crate::arch::riscv::*;
-use crate::arch::riscv::csr::{SSTATUS_SPIE, SSTATUS_SUM};
+use crate::arch::riscv::csr::{SSTATUS_SPIE, SSTATUS_SPP, SSTATUS_SUM};
 use crate::kernel::trap::TrapFrame;
 use crate::kernel::pgtable;
 use crate::kernel::vm;
+use crate::kernel::ipc::{Endpoint, IpcResult, Message, MAX_ENDPOINTS};
 use crate::println;
 use spin::Mutex;
 
@@ -31,6 +32,8 @@ pub enum TaskState {
 pub enum WaitChannel {
     Child(u32),
     UartRx,
+    IpcCall(usize),
+    IpcRecv(usize),
 }
 
 /// 进程控制块
@@ -66,12 +69,15 @@ pub struct TaskManager {
     next_pid: u32,
     /// 可运行进程数
     runnable_count: u32,
+    endpoints: [Option<Endpoint>; MAX_ENDPOINTS],
 }
 
 /// 全局进程管理器
 static TASK_MANAGER: Mutex<Option<TaskManager>> = Mutex::new(None);
 
 impl TaskManager {
+    const IDLE_PID: u32 = 0;
+
     fn free_user_space(
         pagetable: &mut pgtable::PageTable,
         user_stack: usize,
@@ -161,7 +167,52 @@ impl TaskManager {
             tasks: core::array::from_fn(|_| None),
             next_pid: 1,
             runnable_count: 0,
+            endpoints: [None; MAX_ENDPOINTS],
         }
+    }
+
+    /// 创建唯一的内核态 idle 任务。PID 0 不占用普通 PID，也不计入 runnable_count。
+    pub fn create_idle(&mut self, entry: usize) -> Result<u32, ()> {
+        if self.tasks.iter().flatten().any(|task| task.pid == Self::IDLE_PID) {
+            return Err(());
+        }
+        let slot_index = self.tasks.iter().position(|slot| slot.is_none()).ok_or(())?;
+
+        let kernel_stack = crate::kernel::page::alloc().ok_or(())?;
+        let pagetable = pgtable::create().ok_or_else(|| {
+            crate::kernel::page::free(kernel_stack);
+        })?;
+        if vm::map_kernel(pagetable).is_err() {
+            pgtable::free(pagetable);
+            crate::kernel::page::free(kernel_stack);
+            return Err(());
+        }
+
+        let mut frame = TrapFrame::new();
+        frame.sp = kernel_stack + PAGE_SIZE - 16;
+        frame.sepc = entry;
+        // SPP=1 使 sret 返回 S-mode；SPIE=1 使 idle 中可以响应中断。
+        frame.sstatus = SSTATUS_SPP | SSTATUS_SPIE;
+        let trap_frame = Self::init_context(kernel_stack, pagetable, &frame);
+
+        let idle = Task {
+            pid: Self::IDLE_PID,
+            state: TaskState::Ready,
+            trap_frame,
+            kernel_stack,
+            user_stack: 0,
+            entry,
+            pagetable,
+            exit_code: 0,
+            image_base: 0,
+            image_size: 0,
+            builtin_image: true,
+            parent_pid: None,
+            waiting_for: None,
+        };
+        self.tasks[slot_index] = Some(idle);
+        println!("task create idle: pid=0 entry=0x{:x}", entry);
+        Ok(Self::IDLE_PID)
     }
     
     /// 创建新的用户进程
@@ -275,17 +326,33 @@ impl TaskManager {
         let start = current_index.map_or(0, |index| (index + 1) % MAX_TASKS);
         for offset in 0..MAX_TASKS {
             let index = (start + offset) % MAX_TASKS;
-            if self.tasks[index].as_ref().is_some_and(|task| task.state == TaskState::Ready) {
+            if self.tasks[index].as_ref().is_some_and(|task| {
+                task.pid != Self::IDLE_PID && task.state == TaskState::Ready
+            }) {
                 let task = self.tasks[index].as_mut().unwrap();
                 task.state = TaskState::Running;
                 self.current_pid = Some(task.pid);
                 return task.trap_frame;
             }
         }
+
+        // 普通任务全部阻塞时才运行 PID 0。
+        if let Some(idle) = self.tasks.iter_mut().flatten()
+            .find(|task| task.pid == Self::IDLE_PID)
+        {
+            idle.state = TaskState::Running;
+            self.current_pid = Some(Self::IDLE_PID);
+            return idle.trap_frame;
+        }
+
+        // 初始化阶段的保底路径；正常启动后一定存在 PID 0。
         tf as *const TrapFrame as usize
     }
 
     pub fn fork(&mut self, tf: &mut TrapFrame) -> Result<u32, ()> {
+        if self.current_pid == Some(Self::IDLE_PID) {
+            return Err(());
+        }
         let parent_index = self.tasks.iter().position(|slot| {
             slot.as_ref().is_some_and(|task| Some(task.pid) == self.current_pid)
         }).ok_or(())?;
@@ -410,6 +477,9 @@ impl TaskManager {
     }
 
     pub fn waitpid(&mut self, pid: u32, tf: &TrapFrame) -> WaitResult {
+        if self.current_pid == Some(Self::IDLE_PID) {
+            return WaitResult::Error;
+        }
         let Some(parent_pid) = self.current_pid else { return WaitResult::Error };
         let Some(child_index) = self.tasks.iter().position(|slot| {
             slot.as_ref().is_some_and(|task| task.pid == pid && task.parent_pid == Some(parent_pid))
@@ -432,9 +502,132 @@ impl TaskManager {
         self.runnable_count = self.runnable_count.saturating_sub(1);
         WaitResult::Blocked(self.schedule(tf) as *mut TrapFrame)
     }
+
+    fn set_message(frame: &mut TrapFrame, sender: u32, words: [usize; 4]) {
+        frame.a0 = sender as usize;
+        frame.a1 = words[0];
+        frame.a2 = words[1];
+        frame.a3 = words[2];
+        frame.a4 = words[3];
+    }
+
+    pub fn register_endpoint(&mut self, endpoint: usize, owner: u32) -> Result<(), ()> {
+        if endpoint >= MAX_ENDPOINTS || self.endpoints[endpoint].is_some() {
+            return Err(());
+        }
+        if !self.tasks.iter().flatten().any(|task| task.pid == owner) {
+            return Err(());
+        }
+        self.endpoints[endpoint] = Some(Endpoint {
+            owner,
+            waiting_receiver: None,
+            pending: None,
+        });
+        println!("ipc: endpoint={} owner={}", endpoint, owner);
+        Ok(())
+    }
+
+    pub fn ipc_call(
+        &mut self,
+        endpoint: usize,
+        words: [usize; 4],
+        tf: &mut TrapFrame,
+    ) -> IpcResult {
+        let Some(sender) = self.current_pid else { return IpcResult::Error };
+        let (owner, receiver_waiting, pending_busy) = match self.endpoints.get(endpoint).and_then(|e| *e) {
+            Some(ep) => (ep.owner, ep.waiting_receiver == Some(ep.owner), ep.pending.is_some()),
+            None => return IpcResult::Error,
+        };
+        if sender == owner || pending_busy {
+            return IpcResult::Error;
+        }
+
+        let Some(sender_index) = self.tasks.iter().position(|slot| {
+            slot.as_ref().is_some_and(|task| task.pid == sender)
+        }) else { return IpcResult::Error };
+        {
+            let task = self.tasks[sender_index].as_mut().unwrap();
+            task.state = TaskState::Sleeping;
+            task.waiting_for = Some(WaitChannel::IpcCall(endpoint));
+            unsafe { (task.trap_frame as *mut TrapFrame).write(tf.clone()); }
+        }
+        self.runnable_count = self.runnable_count.saturating_sub(1);
+
+        let message = Message { sender, words };
+        if receiver_waiting {
+            let receiver_index = self.tasks.iter().position(|slot| {
+                slot.as_ref().is_some_and(|task| task.pid == owner)
+            }).unwrap();
+            let receiver = self.tasks[receiver_index].as_mut().unwrap();
+            let frame = unsafe { &mut *(receiver.trap_frame as *mut TrapFrame) };
+            Self::set_message(frame, sender, words);
+            receiver.state = TaskState::Ready;
+            receiver.waiting_for = None;
+            self.runnable_count += 1;
+            self.endpoints[endpoint].as_mut().unwrap().waiting_receiver = None;
+        } else {
+            self.endpoints[endpoint].as_mut().unwrap().pending = Some(message);
+        }
+        IpcResult::Blocked(self.schedule(tf) as *mut TrapFrame)
+    }
+
+    pub fn ipc_recv(&mut self, endpoint: usize, tf: &mut TrapFrame) -> IpcResult {
+        let Some(receiver) = self.current_pid else { return IpcResult::Error };
+        let Some(ep) = self.endpoints.get_mut(endpoint).and_then(|e| e.as_mut()) else {
+            return IpcResult::Error;
+        };
+        if ep.owner != receiver {
+            return IpcResult::Error;
+        }
+        if let Some(message) = ep.pending.take() {
+            Self::set_message(tf, message.sender, message.words);
+            return IpcResult::Continue;
+        }
+        ep.waiting_receiver = Some(receiver);
+        let Some(task) = self.current_mut() else { return IpcResult::Error };
+        task.state = TaskState::Sleeping;
+        task.waiting_for = Some(WaitChannel::IpcRecv(endpoint));
+        unsafe { (task.trap_frame as *mut TrapFrame).write(tf.clone()); }
+        self.runnable_count = self.runnable_count.saturating_sub(1);
+        IpcResult::Blocked(self.schedule(tf) as *mut TrapFrame)
+    }
+
+    pub fn ipc_reply(&mut self, client: u32, words: [usize; 4]) -> Result<(), ()> {
+        let replier = self.current_pid.ok_or(())?;
+        let Some(index) = self.tasks.iter().position(|slot| {
+            slot.as_ref().is_some_and(|task| task.pid == client)
+        }) else { return Err(()) };
+        let waiting_endpoint = match self.tasks[index].as_ref().unwrap().waiting_for {
+            Some(WaitChannel::IpcCall(endpoint)) => endpoint,
+            _ => return Err(()),
+        };
+        if self.endpoints
+            .get(waiting_endpoint)
+            .and_then(|endpoint| endpoint.as_ref())
+            .is_none_or(|endpoint| endpoint.owner != replier)
+        {
+            return Err(());
+        }
+        let task = self.tasks[index].as_mut().unwrap();
+        if task.state != TaskState::Sleeping {
+            return Err(());
+        }
+        let frame = unsafe { &mut *(task.trap_frame as *mut TrapFrame) };
+        frame.a0 = words[0];
+        frame.a1 = words[1];
+        frame.a2 = words[2];
+        frame.a3 = words[3];
+        task.state = TaskState::Ready;
+        task.waiting_for = None;
+        self.runnable_count += 1;
+        Ok(())
+    }
     
     /// 退出当前进程
     pub fn exit_current(&mut self, code: i32) -> Option<usize> {
+        if self.current_pid == Some(Self::IDLE_PID) {
+            return self.current().map(|task| task.trap_frame);
+        }
         let mut exited_pid = None;
         let mut parent_pid = None;
 
@@ -486,11 +679,19 @@ impl TaskManager {
         
         // 查找下一个可运行进程
         for task in self.tasks.iter_mut().filter_map(|task| task.as_mut()) {
-            if task.state == TaskState::Ready {
+            if task.pid != Self::IDLE_PID && task.state == TaskState::Ready {
                 task.state = TaskState::Running;
                 self.current_pid = Some(task.pid);
                 return Some(task.trap_frame);
             }
+        }
+
+        if let Some(idle) = self.tasks.iter_mut().flatten()
+            .find(|task| task.pid == Self::IDLE_PID)
+        {
+            idle.state = TaskState::Running;
+            self.current_pid = Some(Self::IDLE_PID);
+            return Some(idle.trap_frame);
         }
         
         None
@@ -498,8 +699,8 @@ impl TaskManager {
     
     /// 列出所有进程
     pub fn list_all(&self) {
-        println!("PID    STATE        ENTRY      USER_SP   ");
-        println!("------ ------------ ---------- ----------");
+        println!("PID    TYPE   STATE        ENTRY      STACK_TOP ");
+        println!("------ ------ ------------ ---------- ----------");
         
         for task in self.tasks.iter().filter_map(|task| task.as_ref()) {
             let state = match task.state {
@@ -510,8 +711,13 @@ impl TaskManager {
                 TaskState::Zombie => "ZOMBIE",
             };
             
-            println!("{:<6} {:<12} 0x{:08x} 0x{:08x}", 
-                     task.pid, state, task.entry, USER_STACK_TOP);
+            let (kind, stack_top) = if task.pid == Self::IDLE_PID {
+                ("IDLE", task.kernel_stack + PAGE_SIZE - 16)
+            } else {
+                ("USER", USER_STACK_TOP)
+            };
+            println!("{:<6} {:<6} {:<12} 0x{:08x} 0x{:08x}",
+                     task.pid, kind, state, task.entry, stack_top);
         }
         
         println!("total: {} runnable", self.runnable_count);
@@ -526,6 +732,11 @@ pub fn init() {
 /// 创建用户进程
 pub fn create_user(image_start: usize, image_end: usize, entry: usize) -> Result<u32, ()> {
     TASK_MANAGER.lock().as_mut().ok_or(())?.create_user(image_start, image_end, entry)
+}
+
+/// 创建固定 PID 0 的内核态 idle 任务。
+pub fn create_idle(entry: usize) -> Result<u32, ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.create_idle(entry)
 }
 
 /// 设置当前进程
@@ -609,6 +820,42 @@ pub fn waitpid(pid: u32, tf: &TrapFrame) -> WaitResult {
         .unwrap_or(WaitResult::Error)
 }
 
+pub fn register_endpoint(endpoint: usize, owner: u32) -> Result<(), ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.register_endpoint(endpoint, owner)
+}
+
+pub fn ipc_call(endpoint: usize, words: [usize; 4], tf: &mut TrapFrame) -> IpcResult {
+    TASK_MANAGER
+        .lock()
+        .as_mut()
+        .map(|manager| manager.ipc_call(endpoint, words, tf))
+        .unwrap_or(IpcResult::Error)
+}
+
+pub fn ipc_recv(endpoint: usize, tf: &mut TrapFrame) -> IpcResult {
+    TASK_MANAGER
+        .lock()
+        .as_mut()
+        .map(|manager| manager.ipc_recv(endpoint, tf))
+        .unwrap_or(IpcResult::Error)
+}
+
+pub fn ipc_reply(client: u32, words: [usize; 4]) -> Result<(), ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.ipc_reply(client, words)
+}
+
+pub fn grant_uart(pid: u32) -> Result<(), ()> {
+    let mut guard = TASK_MANAGER.lock();
+    let manager = guard.as_mut().ok_or(())?;
+    let task = manager.tasks.iter_mut().flatten().find(|task| task.pid == pid).ok_or(())?;
+    pgtable::set_flags(
+        task.pagetable,
+        0x1000_0000,
+        PAGE_SIZE,
+        PTE_R | PTE_W | PTE_U,
+    )
+}
+
 pub fn replace_current(
     pagetable: &'static mut pgtable::PageTable,
     user_stack: usize,
@@ -631,6 +878,40 @@ pub fn translate_user(va: usize) -> Option<usize> {
 /// 列出所有进程
 pub fn list_all() {
     TASK_MANAGER.lock().as_ref().unwrap().list_all();
+}
+
+pub fn sleep_uart(tf: &TrapFrame) -> *mut TrapFrame {
+    let mut guard = TASK_MANAGER.lock();
+    let manager = guard.as_mut().unwrap();
+
+    if let Some(current) = manager.current_mut() {
+        current.state = TaskState::Sleeping;
+        current.waiting_for = Some(WaitChannel::UartRx);
+
+        unsafe {
+            (current.trap_frame as *mut TrapFrame).write(tf.clone());
+        }
+
+        manager.runnable_count =
+            manager.runnable_count.saturating_sub(1);
+    }
+
+    manager.schedule(tf) as *mut TrapFrame
+}
+
+pub fn wake_uart() {
+    let mut guard = TASK_MANAGER.lock();
+    let manager = guard.as_mut().unwrap();
+
+    for task in manager.tasks.iter_mut().flatten() {
+        if task.state == TaskState::Sleeping
+            && task.waiting_for == Some(WaitChannel::UartRx)
+        {
+            task.state = TaskState::Ready;
+            task.waiting_for = None;
+            manager.runnable_count += 1;
+        }
+    }
 }
 
 /// 外部汇编函数

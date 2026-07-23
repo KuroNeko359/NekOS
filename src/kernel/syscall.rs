@@ -14,6 +14,9 @@ pub const SYS_FORK: usize = 6;
 pub const SYS_PS: usize = 7;
 pub const SYS_EXEC: usize = 8;
 pub const SYS_WAITPID: usize = 9;
+pub const SYS_IPC_CALL: usize = 10;
+pub const SYS_IPC_RECV: usize = 11;
+pub const SYS_IPC_REPLY: usize = 12;
 
 /// 系统调用处理
 pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
@@ -61,6 +64,29 @@ pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
                 crate::kernel::task::WaitResult::Blocked(next) => return next,
                 crate::kernel::task::WaitResult::Error => tf.a0 = usize::MAX,
             }
+        }
+        SYS_IPC_CALL => {
+            let endpoint = tf.a0;
+            let words = [tf.a1, tf.a2, tf.a3, tf.a4];
+            match crate::kernel::ipc::call(endpoint, words, tf) {
+                crate::kernel::ipc::IpcResult::Continue => {}
+                crate::kernel::ipc::IpcResult::Blocked(next) => return next,
+                crate::kernel::ipc::IpcResult::Error => tf.a0 = usize::MAX,
+            }
+        }
+        SYS_IPC_RECV => {
+            match crate::kernel::ipc::recv(tf.a0, tf) {
+                crate::kernel::ipc::IpcResult::Continue => {}
+                crate::kernel::ipc::IpcResult::Blocked(next) => return next,
+                crate::kernel::ipc::IpcResult::Error => tf.a0 = usize::MAX,
+            }
+        }
+        SYS_IPC_REPLY => {
+            let result = crate::kernel::ipc::reply(
+                tf.a0 as u32,
+                [tf.a1, tf.a2, tf.a3, tf.a4],
+            );
+            tf.a0 = if result.is_ok() { 0 } else { usize::MAX };
         }
         _ => {
             println!("unknown syscall: {}", syscall_num);
