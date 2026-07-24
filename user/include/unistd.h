@@ -1,6 +1,7 @@
 #ifndef NEKOS_UNISTD_H
 #define NEKOS_UNISTD_H
 
+#include <stdint.h>
 #include <sys/types.h>
 
 ssize_t read(int fd, void *buffer, size_t length);
@@ -9,6 +10,7 @@ ssize_t write(int fd, const void *buffer, size_t length);
 __attribute__((noreturn)) void _exit(int status);
 pid_t getpid(void);
 pid_t fork(void);
+void *sbrk(intptr_t increment);
 
 /*
  * nekos 暂时没有 argv/envp 支持。execve 会加载 path 指定的 initrd 程序，

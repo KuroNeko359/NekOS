@@ -18,6 +18,7 @@ void nekos_ps(void);
 long nekos_exec(const char *name);
 long nekos_waitpid(unsigned int pid);
 long nekos_irq_wait(nekos_word_t irq);
+void *nekos_sbrk(long increment);
 
 long nekos_ipc_call(
     nekos_word_t endpoint,

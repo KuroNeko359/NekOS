@@ -61,6 +61,14 @@ pid_t fork(void) {
     return (pid_t)result;
 }
 
+void *sbrk(intptr_t increment) {
+    void *result = nekos_sbrk((long)increment);
+    if (result == (void *)-1) {
+        errno = ENOMEM;
+    }
+    return result;
+}
+
 int execve(
     const char *path,
     char *const argv[],

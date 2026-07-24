@@ -12,6 +12,7 @@ enum {
     SYS_IPC_RECV = 11,
     SYS_IPC_REPLY = 12,
     SYS_IRQ_WAIT = 13,
+    SYS_SBRK = 14,
 };
 
 static nekos_size_t string_length(const char *text) {
@@ -82,6 +83,13 @@ long nekos_irq_wait(nekos_word_t irq) {
     register nekos_word_t a7 asm("a7") = SYS_IRQ_WAIT;
     asm volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
     return (long)a0;
+}
+
+void *nekos_sbrk(long increment) {
+    register nekos_word_t a0 asm("a0") = (nekos_word_t)increment;
+    register nekos_word_t a7 asm("a7") = SYS_SBRK;
+    asm volatile("ecall" : "+r"(a0) : "r"(a7) : "memory");
+    return (void *)a0;
 }
 
 long nekos_ipc_call(

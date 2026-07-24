@@ -18,6 +18,7 @@ pub const SYS_IPC_CALL: usize = 10;
 pub const SYS_IPC_RECV: usize = 11;
 pub const SYS_IPC_REPLY: usize = 12;
 pub const SYS_IRQ_WAIT: usize = 13;
+pub const SYS_SBRK: usize = 14;
 
 /// 系统调用处理
 pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
@@ -98,6 +99,10 @@ pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
                     Err(()) => tf.a0 = usize::MAX,
                 }
             }
+        }
+        SYS_SBRK => {
+            tf.a0 = crate::kernel::task::sbrk(tf.a0 as isize)
+                .unwrap_or(usize::MAX);
         }
         _ => {
             println!("unknown syscall: {}", syscall_num);

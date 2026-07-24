@@ -18,7 +18,7 @@ int main(void) {
         return 1;
     }
     if (child == 0) {
-        execve("hello-c", 0, 0);
+        execve("test", 0, 0);
         _exit(2);
     }
 

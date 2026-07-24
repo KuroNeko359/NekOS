@@ -27,8 +27,8 @@ fn main() -> ! {
                 println!("  ps        - list all processes");
                 println!("  yield     - yield CPU to other tasks");
                 println!("  fork      - fork a child process");
-                println!("  exec NAME - execute program from initrd");
-                println!("  exectest  - fork then exec hello in child");
+                println!("  exec NAME - replace shell with program (no return)");
+                println!("  COMMAND   - fork+exec+wait (e.g. hello, linked-list-test)");
                 println!("  wait PID  - wait for and reap a child");
                 println!("  exit      - exit the shell");
             }
@@ -82,6 +82,7 @@ fn main() -> ! {
                 println!("goodbye!");
                 syscall::exit(0);
             }
+            // TODO 考虑改成抽象语法树解析
             command if command.starts_with("exec ") => {
                 let name = command[5..].trim();
                 if syscall::exec(name) == syscall::ERROR {
@@ -101,7 +102,27 @@ fn main() -> ! {
                     Err(_) => println!("usage: wait PID"),
                 }
             }
-            _ => println!("unknown command: {}", cmd),
+            _ => {
+                // 未知命令：尝试 fork+exec+wait 运行同名程序
+                let pid = syscall::fork();
+                if pid == 0 {
+                    // 子进程：执行程序
+                    if syscall::exec(cmd) == syscall::ERROR {
+                        println!("{}: command not found", cmd);
+                        syscall::exit(127);
+                    }
+                    // exec 成功后不会回到这里
+                    unreachable!();
+                } else if pid == syscall::ERROR {
+                    println!("fork failed");
+                } else {
+                    // 父进程：等待子进程结束
+                    match syscall::waitpid(pid as u32) {
+                        code if code < 0 => println!("waitpid failed"),
+                        _ => {},
+                    }
+                }
+            }
         }
     }
 }

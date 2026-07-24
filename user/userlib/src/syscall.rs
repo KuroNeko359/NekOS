@@ -8,6 +8,7 @@ const SYS_PS: usize = 7;
 const SYS_EXEC: usize = 8;
 const SYS_WAITPID: usize = 9;
 const SYS_IRQ_WAIT: usize = 13;
+const SYS_SBRK: usize = 14;
 
 pub const ERROR: isize = -1;
 pub const UART0_IRQ: usize = 10;
@@ -103,4 +104,16 @@ pub fn irq_wait(irq: usize) -> Result<(), ()> {
         );
     }
     if result == usize::MAX { Err(()) } else { Ok(()) }
+}
+
+pub fn sbrk(increment: isize) -> Result<usize, ()> {
+    let result: usize;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            inlateout("a0") increment as usize => result,
+            in("a7") SYS_SBRK,
+        );
+    }
+    if result == usize::MAX { Err(()) } else { Ok(result) }
 }

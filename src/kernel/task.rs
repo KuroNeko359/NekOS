@@ -41,6 +41,8 @@ pub struct Task {
     pub exit_code: i32,
     pub image_base: usize,
     pub image_size: usize,
+    pub heap_base: usize,
+    pub heap_end: usize,
     pub parent_pid: Option<u32>,
     pub waiting_for: Option<WaitChannel>,
 }
@@ -70,16 +72,36 @@ static TASK_MANAGER: Mutex<Option<TaskManager>> = Mutex::new(None);
 
 impl TaskManager {
     const IDLE_PID: u32 = 0;
+    // 用户栈占用最后一页，并在堆与栈之间保留一页不可映射的保护页。
+    const HEAP_LIMIT: usize = USER_STACK_TOP - 2 * PAGE_SIZE;
+
+    fn align_up(value: usize) -> Result<usize, ()> {
+        value
+            .checked_add(PAGE_SIZE - 1)
+            .map(|value| value & !(PAGE_SIZE - 1))
+            .ok_or(())
+    }
 
     fn free_user_space(
         pagetable: &mut pgtable::PageTable,
         user_stack: usize,
         image_base: usize,
         image_size: usize,
+        heap_base: usize,
+        heap_end: usize,
     ) {
         let start = image_base & !(PAGE_SIZE - 1);
         let end = (image_base + image_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
         for va in (start..end).step_by(PAGE_SIZE) {
+            if let Some(pte) = pgtable::walk(pagetable, va, false) {
+                if (*pte & PTE_V) != 0 {
+                    crate::kernel::page::free(pgtable::pte_to_pa(*pte));
+                    *pte = 0;
+                }
+            }
+        }
+        let heap_mapped_end = Self::align_up(heap_end).unwrap_or(heap_base);
+        for va in (heap_base..heap_mapped_end).step_by(PAGE_SIZE) {
             if let Some(pte) = pgtable::walk(pagetable, va, false) {
                 if (*pte & PTE_V) != 0 {
                     crate::kernel::page::free(pgtable::pte_to_pa(*pte));
@@ -99,6 +121,8 @@ impl TaskManager {
             task.user_stack,
             task.image_base,
             task.image_size,
+            task.heap_base,
+            task.heap_end,
         );
     }
 
@@ -186,6 +210,8 @@ impl TaskManager {
             exit_code: 0,
             image_base: 0,
             image_size: 0,
+            heap_base: 0,
+            heap_end: 0,
             parent_pid: None,
             waiting_for: None,
         };
@@ -203,17 +229,43 @@ impl TaskManager {
         image_base: usize,
         image_size: usize,
     ) -> Result<u32, ()> {
+        let heap_base = image_base.checked_add(image_size).ok_or(())?;
+        if heap_base > Self::HEAP_LIMIT || heap_base % PAGE_SIZE != 0 {
+            Self::free_user_space(
+                pagetable,
+                user_stack,
+                image_base,
+                image_size,
+                heap_base,
+                heap_base,
+            );
+            return Err(());
+        }
         let slot_index = match self.tasks.iter().position(|slot| slot.is_none()) {
             Some(index) => index,
             None => {
-                Self::free_user_space(pagetable, user_stack, image_base, image_size);
+                Self::free_user_space(
+                    pagetable,
+                    user_stack,
+                    image_base,
+                    image_size,
+                    heap_base,
+                    heap_base,
+                );
                 return Err(());
             }
         };
         let kernel_stack = match crate::kernel::page::alloc() {
             Some(stack) => stack,
             None => {
-                Self::free_user_space(pagetable, user_stack, image_base, image_size);
+                Self::free_user_space(
+                    pagetable,
+                    user_stack,
+                    image_base,
+                    image_size,
+                    heap_base,
+                    heap_base,
+                );
                 return Err(());
             }
         };
@@ -237,6 +289,8 @@ impl TaskManager {
             exit_code: 0,
             image_base,
             image_size,
+            heap_base,
+            heap_end: heap_base,
             parent_pid: self.current_pid,
             waiting_for: None,
         };
@@ -325,10 +379,17 @@ impl TaskManager {
         let parent_index = self.tasks.iter().position(|slot| {
             slot.as_ref().is_some_and(|task| Some(task.pid) == self.current_pid)
         }).ok_or(())?;
-        let (image_base, image_size, entry, parent_stack, parent_pt) = {
+        let (image_base, image_size, heap_base, heap_end, entry, parent_stack, parent_pt) = {
             let parent = self.tasks[parent_index].as_mut().ok_or(())?;
-            (parent.image_base, parent.image_size, parent.entry,
-             parent.user_stack, parent.pagetable as *mut pgtable::PageTable)
+            (
+                parent.image_base,
+                parent.image_size,
+                parent.heap_base,
+                parent.heap_end,
+                parent.entry,
+                parent.user_stack,
+                parent.pagetable as *mut pgtable::PageTable,
+            )
         };
 
         let child_kernel_stack = crate::kernel::page::alloc().ok_or(())?;
@@ -341,6 +402,22 @@ impl TaskManager {
             let source_pte = pgtable::walk(unsafe { &mut *parent_pt }, va, false)
                 .map(|pte| *pte).filter(|pte| pte & PTE_V != 0);
             let Some(source_pte) = source_pte else { continue };
+            let page = crate::kernel::page::alloc().ok_or(())?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    pgtable::pte_to_pa(source_pte) as *const u8,
+                    page as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            pgtable::map(child_pt, va, page, PAGE_SIZE, source_pte & 0x3fe)?;
+        }
+        let heap_mapped_end = Self::align_up(heap_end)?;
+        for va in (heap_base..heap_mapped_end).step_by(PAGE_SIZE) {
+            let source_pte = pgtable::walk(unsafe { &mut *parent_pt }, va, false)
+                .map(|pte| *pte)
+                .filter(|pte| pte & PTE_V != 0)
+                .ok_or(())?;
             let page = crate::kernel::page::alloc().ok_or(())?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -382,6 +459,8 @@ impl TaskManager {
             exit_code: 0,
             image_base,
             image_size,
+            heap_base,
+            heap_end,
             parent_pid: self.current_pid,
             waiting_for: None,
         };
@@ -402,9 +481,20 @@ impl TaskManager {
         image_size: usize,
         tf: &mut TrapFrame,
     ) -> Result<(), ()> {
+        let heap_base = image_base.checked_add(image_size).ok_or(())?;
+        if heap_base > Self::HEAP_LIMIT || heap_base % PAGE_SIZE != 0 {
+            return Err(());
+        }
         let user_satp = (8usize << 60)
             | ((pagetable as *const pgtable::PageTable as usize) >> PAGE_SHIFT);
-        let (old_pagetable, old_user_stack, old_image_base, old_image_size) = {
+        let (
+            old_pagetable,
+            old_user_stack,
+            old_image_base,
+            old_image_size,
+            old_heap_base,
+            old_heap_end,
+        ) = {
             let current = self.current_mut().ok_or(())?;
             let old_pagetable = core::mem::replace(&mut current.pagetable, pagetable);
             let old = (
@@ -412,11 +502,15 @@ impl TaskManager {
                 current.user_stack,
                 current.image_base,
                 current.image_size,
+                current.heap_base,
+                current.heap_end,
             );
             current.user_stack = user_stack;
             current.entry = entry;
             current.image_base = image_base;
             current.image_size = image_size;
+            current.heap_base = heap_base;
+            current.heap_end = heap_base;
             unsafe {
                 ((current.trap_frame + core::mem::size_of::<TrapFrame>() + 8) as *mut usize)
                     .write(user_satp);
@@ -433,8 +527,74 @@ impl TaskManager {
             old_user_stack,
             old_image_base,
             old_image_size,
+            old_heap_base,
+            old_heap_end,
         );
         Ok(())
+    }
+
+    pub fn sbrk(&mut self, increment: isize) -> Result<usize, ()> {
+        if self.current_pid == Some(Self::IDLE_PID) {
+            return Err(());
+        }
+        let task = self.current_mut().ok_or(())?;
+        let old_end = task.heap_end;
+        let new_end = old_end.checked_add_signed(increment).ok_or(())?;
+        if new_end < task.heap_base || new_end > Self::HEAP_LIMIT {
+            return Err(());
+        }
+
+        let old_mapped_end = Self::align_up(old_end)?;
+        let new_mapped_end = Self::align_up(new_end)?;
+        if new_mapped_end > old_mapped_end {
+            let mut mapped_end = old_mapped_end;
+            while mapped_end < new_mapped_end {
+                let Some(page) = crate::kernel::page::alloc() else {
+                    if mapped_end > old_mapped_end {
+                        let _ = pgtable::unmap(
+                            task.pagetable,
+                            old_mapped_end,
+                            mapped_end - old_mapped_end,
+                            true,
+                        );
+                    }
+                    return Err(());
+                };
+                unsafe {
+                    core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+                }
+                if pgtable::map(
+                    task.pagetable,
+                    mapped_end,
+                    page,
+                    PAGE_SIZE,
+                    PTE_R | PTE_W | PTE_U,
+                )
+                .is_err() {
+                    crate::kernel::page::free(page);
+                    if mapped_end > old_mapped_end {
+                        let _ = pgtable::unmap(
+                            task.pagetable,
+                            old_mapped_end,
+                            mapped_end - old_mapped_end,
+                            true,
+                        );
+                    }
+                    return Err(());
+                }
+                mapped_end += PAGE_SIZE;
+            }
+        } else if new_mapped_end < old_mapped_end {
+            pgtable::unmap(
+                task.pagetable,
+                new_mapped_end,
+                old_mapped_end - new_mapped_end,
+                true,
+            )?;
+        }
+
+        task.heap_end = new_end;
+        Ok(old_end)
     }
 
     pub fn waitpid(&mut self, pid: u32, tf: &TrapFrame) -> WaitResult {
@@ -813,6 +973,10 @@ pub fn exit_current(code: i32) -> *mut TrapFrame {
 
 pub fn fork(tf: &mut TrapFrame) -> Result<u32, ()> {
     TASK_MANAGER.lock().as_mut().ok_or(())?.fork(tf)
+}
+
+pub fn sbrk(increment: isize) -> Result<usize, ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.sbrk(increment)
 }
 
 pub fn waitpid(pid: u32, tf: &TrapFrame) -> WaitResult {

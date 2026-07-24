@@ -56,8 +56,10 @@ nekos/
 │       ├── console/    # Console Server
 │       ├── shell/      # Shell
 │       ├── hello/      # Rust hello
-│       ├── hello-c/    # C hello
-│       └── test/       # 最小测试程序
+│       ├── test/       # Rust 最小测试程序
+│       ├── test-c/     # C 九九乘法表
+│       ├── posix-test/ # POSIX 进程接口测试
+│       └── heap-test/  # sbrk 与 fork 堆隔离测试
 ├── src/
 │   ├── main.rs         # 内核入口点
 │   ├── arch/
@@ -133,13 +135,13 @@ int main(void) {
 C API 在 `user/include/nekos.h` 中，目前包括：
 
 - `nekos_exit`、`nekos_yield`、`nekos_getpid`
-- `nekos_fork`、`nekos_exec`、`nekos_waitpid`、`nekos_ps`
+- `nekos_fork`、`nekos_exec`、`nekos_waitpid`、`nekos_ps`、`nekos_sbrk`
 - `nekos_ipc_call`、`nekos_ipc_recv`、`nekos_ipc_reply`
 - `nekos_read`、`nekos_write`、`nekos_irq_wait`
 
 普通程序优先使用 POSIX 风格接口：
 
-- `<unistd.h>`：`read`、`write`、`_exit`、`getpid`、`fork`、`execve`
+- `<unistd.h>`：`read`、`write`、`_exit`、`getpid`、`fork`、`execve`、`sbrk`
 - `<sys/wait.h>`：`waitpid`、`WIFEXITED`、`WEXITSTATUS`
 - `<stdlib.h>`：`exit`、`_Exit`
 - `<stdio.h>`：`putchar`、`puts`、最小 `printf`
@@ -176,6 +178,7 @@ Rust 文件。
 | 11 | ipc_recv | 服务端接收请求 |
 | 12 | ipc_reply | 服务端回复客户端 |
 | 13 | irq_wait | 设备服务等待已授权的硬件中断 |
+| 14 | sbrk | 调整当前进程的堆末尾 |
 
 ## 微内核边界
 
@@ -186,6 +189,8 @@ endpoint 1 同步调用服务。
 Console 等待输入时调用 `irq_wait` 进入 Sleeping，UART RX 中断将其唤醒；没有普通任务可运行时
 PID 0 执行 `wfi`。
 `read/write` 系统调用目前仅作为 initrd 旧程序的兼容接口保留，后续服务全部迁移后可删除。
+用户堆从 ELF 映像末尾开始按需映射，栈下方保留一页保护页；`fork` 会复制现有堆页，
+`exec` 和进程回收会释放旧堆页。
 
 ## 许可证
 
