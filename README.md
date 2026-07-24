@@ -205,7 +205,7 @@ PID 0 执行 `wfi`。
 | Shell | 普通文件名会通过 `fork + exec + waitpid` 执行 |
 | 用户堆 | `sbrk` 已完成 |
 | C 运行库 | `printf`、POSIX 包装和 `malloc/free/calloc/realloc` 已存在 |
-| 文件系统 | 尚未实现 |
+| 文件系统 | 初步实现了FAT32 |
 | `mmap`、线程、多核、网络 | 尚未实现 |
 
 ## 许可证
