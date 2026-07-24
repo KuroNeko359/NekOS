@@ -749,6 +749,78 @@ impl TaskManager {
         Ok(())
     }
 
+    /// 带缓冲区的 ipc_reply：回复 words + 将 replier 用户空间的 buf[0..buf_len]
+    /// 复制到被阻塞的 caller 用户空间。
+    pub fn ipc_reply_buf(
+        &mut self,
+        client: u32,
+        words: [usize; 4],
+        user_buf: usize,
+        buf_len: usize,
+    ) -> Result<(), ()> {
+        let replier = self.current_pid.ok_or(())?;
+        let Some(index) = self.tasks.iter().position(|slot| {
+            slot.as_ref().is_some_and(|task| task.pid == client)
+        }) else { return Err(()) };
+        let waiting_endpoint = match self.tasks[index].as_ref().unwrap().waiting_for {
+            Some(WaitChannel::IpcCall(endpoint)) => endpoint,
+            _ => return Err(()),
+        };
+        if self.endpoints
+            .get(waiting_endpoint)
+            .and_then(|endpoint| endpoint.as_ref())
+            .is_none_or(|endpoint| endpoint.owner != replier)
+        {
+            return Err(());
+        }
+        // 获取 replier 和 caller 的页表指针（避免双重 borrow）
+        let (replier_pt_opt, caller_pt_raw) = {
+            let mut replier_pt = None;
+            let mut caller_pt = core::ptr::null_mut();
+            for task in self.tasks.iter_mut().flatten() {
+                if Some(task.pid) == self.current_pid && buf_len > 0 {
+                    replier_pt = Some(task.pagetable as *mut pgtable::PageTable);
+                }
+                if task.pid == client {
+                    caller_pt = task.pagetable as *mut pgtable::PageTable;
+                }
+            }
+            (replier_pt, caller_pt)
+        };
+        let task = self.tasks[index].as_mut().unwrap();
+        if task.state != TaskState::Sleeping {
+            return Err(());
+        }
+        let frame = unsafe { &mut *(task.trap_frame as *mut TrapFrame) };
+        let caller_buf_addr = frame.a5;
+        let caller_buf_capacity = frame.a6;
+        let copy_len = buf_len
+            .min(caller_buf_capacity)
+            .min(crate::kernel::ipc::IPC_BUF_SIZE);
+        frame.a0 = words[0];
+        frame.a1 = words[1];
+        frame.a2 = words[2];
+        frame.a3 = words[3];
+        frame.a5 = copy_len; // 返回给 caller 的实际数据长度
+        if copy_len > 0 {
+            let replier_pt = replier_pt_opt.unwrap();
+            let caller_pt = caller_pt_raw;
+            for i in 0..copy_len {
+                let src_pa = pgtable::virt_to_phys(unsafe { &mut *replier_pt }, user_buf + i)
+                    .ok_or(())?;
+                let dst_pa = pgtable::virt_to_phys(unsafe { &mut *caller_pt }, caller_buf_addr + i)
+                    .ok_or(())?;
+                unsafe {
+                    core::ptr::write(dst_pa as *mut u8, core::ptr::read(src_pa as *const u8));
+                }
+            }
+        }
+        task.state = TaskState::Ready;
+        task.waiting_for = None;
+        self.runnable_count += 1;
+        Ok(())
+    }
+
     /// 从用户空间复制 len 字节到 dst，使用指定的页表。
     fn mem_copy_from_user(
         pagetable: &mut pgtable::PageTable,
@@ -1203,6 +1275,15 @@ pub fn ipc_recv_buf(
     tf: &mut TrapFrame,
 ) -> IpcResult {
     TASK_MANAGER.lock().as_mut().unwrap().ipc_recv_buf(endpoint, user_buf, capacity, tf)
+}
+
+pub fn ipc_reply_buf(
+    client: u32,
+    words: [usize; 4],
+    user_buf: usize,
+    buf_len: usize,
+) -> Result<(), ()> {
+    TASK_MANAGER.lock().as_mut().ok_or(())?.ipc_reply_buf(client, words, user_buf, buf_len)
 }
 
 pub fn grant_uart(pid: u32) -> Result<(), ()> {

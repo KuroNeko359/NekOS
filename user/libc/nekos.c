@@ -15,6 +15,7 @@ enum {
     SYS_SBRK = 14,
     SYS_IPC_CALL_BUF = 15,
     SYS_IPC_RECV_BUF = 16,
+    SYS_IPC_REPLY_BUF = 17,
 };
 
 static nekos_size_t string_length(const char *text) {
@@ -242,6 +243,25 @@ long nekos_ipc_recv_buf(
     *out_len = a5;
     (void)a6;
     return 0;
+}
+
+long nekos_ipc_reply_buf(unsigned int client, const nekos_word_t words[4],
+                         const void *buf, nekos_size_t buf_len) {
+    register nekos_word_t a0 asm("a0") = client;
+    register nekos_word_t a1 asm("a1") = words[0];
+    register nekos_word_t a2 asm("a2") = words[1];
+    register nekos_word_t a3 asm("a3") = words[2];
+    register nekos_word_t a4 asm("a4") = words[3];
+    register nekos_word_t a5 asm("a5") = (nekos_word_t)buf;
+    register nekos_word_t a6 asm("a6") = buf_len;
+    register nekos_word_t a7 asm("a7") = SYS_IPC_REPLY_BUF;
+    asm volatile(
+        "ecall"
+        : "+r"(a0)
+        : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7)
+        : "memory"
+    );
+    return a0 == 0 ? 0 : NEKOS_ERROR;
 }
 
 long nekos_read(int fd, void *buffer, nekos_size_t length) {

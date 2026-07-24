@@ -140,3 +140,12 @@ pub fn recv_buf(
 ) -> IpcResult {
     crate::kernel::task::ipc_recv_buf(endpoint, user_buf, capacity, tf)
 }
+
+pub fn reply_buf(
+    client: u32,
+    words: [usize; 4],
+    user_buf: usize,
+    buf_len: usize,
+) -> Result<(), ()> {
+    crate::kernel::task::ipc_reply_buf(client, words, user_buf, buf_len)
+}

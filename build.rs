@@ -83,6 +83,7 @@ fn compile_c_user(
     posix: &PathBuf,
     stdio: &PathBuf,
     alloc: &PathBuf,
+    fdtable: &PathBuf,
     startup: &PathBuf,
 ) {
     let status = Command::new("riscv64-elf-gcc")
@@ -117,6 +118,7 @@ fn compile_c_user(
         .arg(posix)
         .arg(stdio)
         .arg(alloc)
+        .arg(fdtable)
         .arg(src)
         .status()
         .expect("Failed to compile C user program");
@@ -174,6 +176,7 @@ fn main() {
     let c_posix = user_dir.join("libc/posix.c");
     let c_stdio = user_dir.join("libc/printf.c");
     let c_alloc = user_dir.join("libc/malloc.c");
+    let c_fdtable = user_dir.join("libc/fd_table.c");
     let c_startup = user_dir.join("libc/crt0.S");
 
     let user_programs_dir = user_dir.join("programs");
@@ -208,6 +211,7 @@ fn main() {
                 &c_posix,
                 &c_stdio,
                 &c_alloc,
+                &c_fdtable,
                 &c_startup,
             );
         } else {

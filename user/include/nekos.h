@@ -46,6 +46,8 @@ long nekos_ipc_recv_buf(
     nekos_size_t capacity,
     nekos_size_t *out_len
 );
+long nekos_ipc_reply_buf(unsigned int client, const nekos_word_t words[4],
+                         const void *buf, nekos_size_t buf_len);
 
 long nekos_write(int fd, const void *buffer, nekos_size_t length);
 long nekos_read(int fd, void *buffer, nekos_size_t length);

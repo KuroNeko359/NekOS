@@ -21,6 +21,7 @@ pub const SYS_IRQ_WAIT: usize = 13;
 pub const SYS_SBRK: usize = 14;
 pub const SYS_IPC_CALL_BUF: usize = 15;
 pub const SYS_IPC_RECV_BUF: usize = 16;
+pub const SYS_IPC_REPLY_BUF: usize = 17;
 
 /// 系统调用处理
 pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
@@ -126,6 +127,14 @@ pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
                 crate::kernel::ipc::IpcResult::Blocked(next) => return next,
                 crate::kernel::ipc::IpcResult::Error => tf.a0 = usize::MAX,
             }
+        }
+        SYS_IPC_REPLY_BUF => {
+            let client = tf.a0 as u32;
+            let words = [tf.a1, tf.a2, tf.a3, tf.a4];
+            let user_buf = tf.a5;
+            let buf_len = tf.a6;
+            let result = crate::kernel::ipc::reply_buf(client, words, user_buf, buf_len);
+            tf.a0 = if result.is_ok() { 0 } else { usize::MAX };
         }
         _ => {
             println!("unknown syscall: {}", syscall_num);

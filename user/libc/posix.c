@@ -1,35 +1,57 @@
 #include <errno.h>
 #include <nekos.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 int errno;
 
+/* fd_table.c 中的内部函数 */
+extern int __fd_is_file(int fd);
+extern long __fd_read(int fd, void *buffer, nekos_size_t length);
+extern long __fd_write(int fd, const void *buffer, nekos_size_t length);
+
 ssize_t write(int fd, const void *buffer, size_t length) {
-    if (fd != 1 && fd != 2) {
-        errno = EBADF;
-        return -1;
+    if (fd == 1 || fd == 2) {
+        long result = nekos_write(fd, buffer, length);
+        if (result < 0) {
+            errno = EIO;
+            return -1;
+        }
+        return (ssize_t)result;
     }
-    long result = nekos_write(fd, buffer, length);
-    if (result < 0) {
-        errno = EIO;
-        return -1;
+    if (__fd_is_file(fd)) {
+        long result = __fd_write(fd, buffer, (nekos_size_t)length);
+        if (result < 0) {
+            errno = EIO;
+            return -1;
+        }
+        return (ssize_t)result;
     }
-    return (ssize_t)result;
+    errno = EBADF;
+    return -1;
 }
 
 ssize_t read(int fd, void *buffer, size_t length) {
-    if (fd != 0) {
-        errno = EBADF;
-        return -1;
+    if (fd == 0) {
+        long result = nekos_read(fd, buffer, length);
+        if (result < 0) {
+            errno = EIO;
+            return -1;
+        }
+        return (ssize_t)result;
     }
-    long result = nekos_read(fd, buffer, length);
-    if (result < 0) {
-        errno = EIO;
-        return -1;
+    if (__fd_is_file(fd)) {
+        long result = __fd_read(fd, buffer, (nekos_size_t)length);
+        if (result < 0) {
+            errno = EIO;
+            return -1;
+        }
+        return (ssize_t)result;
     }
-    return (ssize_t)result;
+    errno = EBADF;
+    return -1;
 }
 
 __attribute__((noreturn)) void _exit(int status) {
