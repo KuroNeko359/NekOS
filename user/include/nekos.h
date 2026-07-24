@@ -52,4 +52,6 @@ long nekos_ipc_reply_buf(unsigned int client, const nekos_word_t words[4],
 long nekos_write(int fd, const void *buffer, nekos_size_t length);
 long nekos_read(int fd, void *buffer, nekos_size_t length);
 
+__attribute__((noreturn)) void nekos_shutdown(void);
+
 #endif

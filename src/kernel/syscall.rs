@@ -22,6 +22,7 @@ pub const SYS_SBRK: usize = 14;
 pub const SYS_IPC_CALL_BUF: usize = 15;
 pub const SYS_IPC_RECV_BUF: usize = 16;
 pub const SYS_IPC_REPLY_BUF: usize = 17;
+pub const SYS_SHUTDOWN: usize = 18;
 
 /// 系统调用处理
 pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
@@ -135,6 +136,10 @@ pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
             let buf_len = tf.a6;
             let result = crate::kernel::ipc::reply_buf(client, words, user_buf, buf_len);
             tf.a0 = if result.is_ok() { 0 } else { usize::MAX };
+        }
+        SYS_SHUTDOWN => {
+            println!("shutdown requested");
+            crate::arch::riscv::sbi::shutdown();
         }
         _ => {
             println!("unknown syscall: {}", syscall_num);

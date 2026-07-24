@@ -16,6 +16,7 @@ enum {
     SYS_IPC_CALL_BUF = 15,
     SYS_IPC_RECV_BUF = 16,
     SYS_IPC_REPLY_BUF = 17,
+    SYS_SHUTDOWN = 18,
 };
 
 static nekos_size_t string_length(const char *text) {
@@ -184,6 +185,14 @@ long nekos_write(int fd, const void *buffer, nekos_size_t length) {
         }
     }
     return (long)length;
+}
+
+__attribute__((noreturn)) void nekos_shutdown(void) {
+    register nekos_word_t a7 asm("a7") = SYS_SHUTDOWN;
+    asm volatile("ecall" :: "r"(a7) : "memory");
+    for (;;) {
+        asm volatile("" ::: "memory");
+    }
 }
 
 long nekos_ipc_call_buf(
