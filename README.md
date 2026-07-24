@@ -192,6 +192,22 @@ PID 0 执行 `wfi`。
 用户堆从 ELF 映像末尾开始按需映射，栈下方保留一页保护页；`fork` 会复制现有堆页，
 `exec` 和进程回收会释放旧堆页。
 
+## 开发进度
+| 子系统 | 当前状态 |
+|---|---|
+| 启动、Sv39 页表、物理页分配 | 已完成基础版本 |
+| 定时器、抢占调度、PID 0 idle | 已完成 |
+| 多进程 | 已支持，尚无线程 |
+| `fork/exec/exit/waitpid` | 已能完整运行 |
+| 用户 ELF/initrd | Rust、C 程序可自动编译和加载 |
+| 微内核 IPC | 支持同步 call/recv/reply，但只能传少量寄存器数据 |
+| Console Server | 已在用户态，通过 IPC 使用 UART |
+| Shell | 普通文件名会通过 `fork + exec + waitpid` 执行 |
+| 用户堆 | `sbrk` 已完成 |
+| C 运行库 | `printf`、POSIX 包装和 `malloc/free/calloc/realloc` 已存在 |
+| 文件系统 | 尚未实现 |
+| `mmap`、线程、多核、网络 | 尚未实现 |
+
 ## 许可证
 
 MIT License
