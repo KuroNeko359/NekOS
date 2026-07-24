@@ -170,7 +170,7 @@ impl TaskManager {
             tasks: core::array::from_fn(|_| None),
             next_pid: 1,
             runnable_count: 0,
-            endpoints: [None; MAX_ENDPOINTS],
+            endpoints: core::array::from_fn(|_| None),
             uart_owner: None,
         }
     }
@@ -642,7 +642,12 @@ impl TaskManager {
         self.endpoints[endpoint] = Some(Endpoint {
             owner,
             waiting_receiver: None,
-            pending: None,
+            pending: crate::kernel::ipc::MsgQueue::new(),
+            copy_buf: [0u8; crate::kernel::ipc::IPC_BUF_SIZE],
+            copy_len: 0,
+            recv_buf_addr: 0,
+            recv_buf_capacity: 0,
+            has_buffered: false,
         });
         println!("ipc: endpoint={} owner={}", endpoint, owner);
         Ok(())
@@ -655,11 +660,11 @@ impl TaskManager {
         tf: &mut TrapFrame,
     ) -> IpcResult {
         let Some(sender) = self.current_pid else { return IpcResult::Error };
-        let (owner, receiver_waiting, pending_busy) = match self.endpoints.get(endpoint).and_then(|e| *e) {
-            Some(ep) => (ep.owner, ep.waiting_receiver == Some(ep.owner), ep.pending.is_some()),
+        let (owner, receiver_waiting, queue_full) = match self.endpoints.get(endpoint).and_then(|e| e.as_ref()) {
+            Some(ep) => (ep.owner, ep.waiting_receiver == Some(ep.owner), ep.pending.is_full()),
             None => return IpcResult::Error,
         };
-        if sender == owner || pending_busy {
+        if sender == owner || queue_full {
             return IpcResult::Error;
         }
 
@@ -674,7 +679,7 @@ impl TaskManager {
         }
         self.runnable_count = self.runnable_count.saturating_sub(1);
 
-        let message = Message { sender, words };
+        let message = Message { sender, words, buf_len: 0 };
         if receiver_waiting {
             let receiver_index = self.tasks.iter().position(|slot| {
                 slot.as_ref().is_some_and(|task| task.pid == owner)
@@ -687,7 +692,7 @@ impl TaskManager {
             self.runnable_count += 1;
             self.endpoints[endpoint].as_mut().unwrap().waiting_receiver = None;
         } else {
-            self.endpoints[endpoint].as_mut().unwrap().pending = Some(message);
+            self.endpoints[endpoint].as_mut().unwrap().pending.push(message).ok();
         }
         IpcResult::Blocked(self.schedule(tf) as *mut TrapFrame)
     }
@@ -700,7 +705,7 @@ impl TaskManager {
         if ep.owner != receiver {
             return IpcResult::Error;
         }
-        if let Some(message) = ep.pending.take() {
+        if let Some(message) = ep.pending.pop() {
             Self::set_message(tf, message.sender, message.words);
             return IpcResult::Continue;
         }
@@ -742,6 +747,176 @@ impl TaskManager {
         task.waiting_for = None;
         self.runnable_count += 1;
         Ok(())
+    }
+
+    /// 从用户空间复制 len 字节到 dst，使用指定的页表。
+    fn mem_copy_from_user(
+        pagetable: &mut pgtable::PageTable,
+        dst: &mut [u8],
+        user_src: usize,
+        len: usize,
+    ) -> Result<(), ()> {
+        let len = len.min(dst.len());
+        for i in 0..len {
+            let pa = pgtable::virt_to_phys(pagetable, user_src + i).ok_or(())?;
+            dst[i] = unsafe { core::ptr::read(pa as *const u8) };
+        }
+        Ok(())
+    }
+
+    /// 从 src 复制 len 字节到用户空间，使用指定的页表。
+    fn mem_copy_to_user(
+        pagetable: &mut pgtable::PageTable,
+        user_dst: usize,
+        src: &[u8],
+        len: usize,
+    ) -> Result<(), ()> {
+        let len = len.min(src.len());
+        for i in 0..len {
+            let pa = pgtable::virt_to_phys(pagetable, user_dst + i).ok_or(())?;
+            unsafe { core::ptr::write(pa as *mut u8, src[i]); }
+        }
+        Ok(())
+    }
+
+    /// 缓冲区版 ipc_call：将 words 和 user_buf[0..buf_len] 一起发送。
+    pub fn ipc_call_buf(
+        &mut self,
+        endpoint: usize,
+        words: [usize; 4],
+        user_buf: usize,
+        buf_len: usize,
+        tf: &mut TrapFrame,
+    ) -> IpcResult {
+        use crate::kernel::ipc::IPC_BUF_SIZE;
+
+        let Some(sender) = self.current_pid else { return IpcResult::Error };
+        let ep = match self.endpoints.get(endpoint).and_then(|e| e.as_ref()) {
+            Some(ep) => ep,
+            None => return IpcResult::Error,
+        };
+        let (owner, receiver_waiting, queue_full) =
+            (ep.owner, ep.waiting_receiver == Some(ep.owner), ep.pending.is_full());
+        // 队列满或者已有缓冲型消息等待，拒绝新的缓冲型请求。
+        // 如果接收者正阻塞等待，可以用 copy_buf 直接传递，不算入队。
+        let buffered_blocked = ep.has_buffered && !receiver_waiting;
+        if sender == owner || queue_full || buffered_blocked {
+            return IpcResult::Error;
+        }
+        if buf_len > IPC_BUF_SIZE {
+            return IpcResult::Error;
+        }
+
+        // 从发送方用户空间复制缓冲区数据到 endpoint 的 copy_buf
+        if buf_len > 0 {
+            // 获取发送方页表指针以避免 borrow 冲突
+            let pt_ptr = match self.current_mut() {
+                Some(task) => task.pagetable as *mut pgtable::PageTable,
+                None => return IpcResult::Error,
+            };
+            let ep_buf = &mut self.endpoints[endpoint].as_mut().unwrap().copy_buf[..buf_len];
+            if Self::mem_copy_from_user(unsafe { &mut *pt_ptr }, ep_buf, user_buf, buf_len).is_err() {
+                return IpcResult::Error;
+            }
+            self.endpoints[endpoint].as_mut().unwrap().copy_len = buf_len;
+        } else {
+            self.endpoints[endpoint].as_mut().unwrap().copy_len = 0;
+        }
+
+        let Some(sender_index) = self.tasks.iter().position(|slot| {
+            slot.as_ref().is_some_and(|task| task.pid == sender)
+        }) else { return IpcResult::Error };
+        {
+            let task = self.tasks[sender_index].as_mut().unwrap();
+            task.state = TaskState::Sleeping;
+            task.waiting_for = Some(WaitChannel::IpcCall(endpoint));
+            unsafe { (task.trap_frame as *mut TrapFrame).write(tf.clone()); }
+        }
+        self.runnable_count = self.runnable_count.saturating_sub(1);
+
+        let message = Message { sender, words, buf_len: buf_len as u16 };
+        if receiver_waiting {
+            let receiver_index = self.tasks.iter().position(|slot| {
+                slot.as_ref().is_some_and(|task| task.pid == owner)
+            }).unwrap();
+            let receiver = self.tasks[receiver_index].as_mut().unwrap();
+            let frame = unsafe { &mut *(receiver.trap_frame as *mut TrapFrame) };
+            Self::set_message(frame, sender, words);
+            // 如果接收方是通过 recv_buf 阻塞的，将缓冲区数据复制到接收方
+            let recv_addr = self.endpoints[endpoint].as_ref().unwrap().recv_buf_addr;
+            let recv_cap = self.endpoints[endpoint].as_ref().unwrap().recv_buf_capacity;
+            if buf_len > 0 && recv_addr != 0 {
+                let copy_len = buf_len.min(recv_cap);
+                let recv_pt = receiver.pagetable as *mut pgtable::PageTable;
+                let ep_buf = &self.endpoints[endpoint].as_ref().unwrap().copy_buf[..copy_len];
+                if Self::mem_copy_to_user(unsafe { &mut *recv_pt }, recv_addr, ep_buf, copy_len).is_ok() {
+                    frame.a5 = copy_len;
+                } else {
+                    frame.a5 = 0;
+                }
+            } else {
+                frame.a5 = 0;
+            }
+            self.endpoints[endpoint].as_mut().unwrap().recv_buf_addr = 0;
+            self.endpoints[endpoint].as_mut().unwrap().recv_buf_capacity = 0;
+            receiver.state = TaskState::Ready;
+            receiver.waiting_for = None;
+            self.runnable_count += 1;
+            self.endpoints[endpoint].as_mut().unwrap().waiting_receiver = None;
+        } else {
+            if buf_len > 0 {
+                self.endpoints[endpoint].as_mut().unwrap().has_buffered = true;
+            }
+            self.endpoints[endpoint].as_mut().unwrap().pending.push(message).ok();
+        }
+        IpcResult::Blocked(self.schedule(tf) as *mut TrapFrame)
+    }
+
+    /// 缓冲区版 ipc_recv：接收消息后将附带的缓冲区数据复制到 user_buf[0..capacity]。
+    pub fn ipc_recv_buf(
+        &mut self,
+        endpoint: usize,
+        user_buf: usize,
+        capacity: usize,
+        tf: &mut TrapFrame,
+    ) -> IpcResult {
+        let Some(receiver) = self.current_pid else { return IpcResult::Error };
+        let Some(ep) = self.endpoints.get_mut(endpoint).and_then(|e| e.as_mut()) else {
+            return IpcResult::Error;
+        };
+        if ep.owner != receiver {
+            return IpcResult::Error;
+        }
+        if let Some(message) = ep.pending.pop() {
+            Self::set_message(tf, message.sender, message.words);
+            if message.buf_len > 0 {
+                self.endpoints[endpoint].as_mut().unwrap().has_buffered = false;
+                let copy_len = (message.buf_len as usize).min(capacity);
+                let pt_ptr = match self.current_mut() {
+                    Some(task) => task.pagetable as *mut pgtable::PageTable,
+                    None => { tf.a5 = 0; return IpcResult::Continue; }
+                };
+                let ep_buf = &self.endpoints[endpoint].as_ref().unwrap().copy_buf[..copy_len];
+                if Self::mem_copy_to_user(unsafe { &mut *pt_ptr }, user_buf, ep_buf, copy_len).is_err() {
+                    tf.a5 = 0;
+                } else {
+                    tf.a5 = copy_len;
+                }
+            } else {
+                tf.a5 = 0;
+            }
+            return IpcResult::Continue;
+        }
+        // 阻塞等待：记录接收方的用户缓冲区地址，供 call_buf 唤醒时使用
+        self.endpoints[endpoint].as_mut().unwrap().waiting_receiver = Some(receiver);
+        self.endpoints[endpoint].as_mut().unwrap().recv_buf_addr = user_buf;
+        self.endpoints[endpoint].as_mut().unwrap().recv_buf_capacity = capacity;
+        let Some(task) = self.current_mut() else { return IpcResult::Error };
+        task.state = TaskState::Sleeping;
+        task.waiting_for = Some(WaitChannel::IpcRecv(endpoint));
+        unsafe { (task.trap_frame as *mut TrapFrame).write(tf.clone()); }
+        self.runnable_count = self.runnable_count.saturating_sub(1);
+        IpcResult::Blocked(self.schedule(tf) as *mut TrapFrame)
     }
     
     /// 退出当前进程
@@ -1009,6 +1184,25 @@ pub fn ipc_recv(endpoint: usize, tf: &mut TrapFrame) -> IpcResult {
 
 pub fn ipc_reply(client: u32, words: [usize; 4]) -> Result<(), ()> {
     TASK_MANAGER.lock().as_mut().ok_or(())?.ipc_reply(client, words)
+}
+
+pub fn ipc_call_buf(
+    endpoint: usize,
+    words: [usize; 4],
+    user_buf: usize,
+    buf_len: usize,
+    tf: &mut TrapFrame,
+) -> IpcResult {
+    TASK_MANAGER.lock().as_mut().unwrap().ipc_call_buf(endpoint, words, user_buf, buf_len, tf)
+}
+
+pub fn ipc_recv_buf(
+    endpoint: usize,
+    user_buf: usize,
+    capacity: usize,
+    tf: &mut TrapFrame,
+) -> IpcResult {
+    TASK_MANAGER.lock().as_mut().unwrap().ipc_recv_buf(endpoint, user_buf, capacity, tf)
 }
 
 pub fn grant_uart(pid: u32) -> Result<(), ()> {

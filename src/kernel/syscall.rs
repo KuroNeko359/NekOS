@@ -19,6 +19,8 @@ pub const SYS_IPC_RECV: usize = 11;
 pub const SYS_IPC_REPLY: usize = 12;
 pub const SYS_IRQ_WAIT: usize = 13;
 pub const SYS_SBRK: usize = 14;
+pub const SYS_IPC_CALL_BUF: usize = 15;
+pub const SYS_IPC_RECV_BUF: usize = 16;
 
 /// 系统调用处理
 pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
@@ -103,6 +105,27 @@ pub fn handle(tf: &mut TrapFrame) -> *mut TrapFrame {
         SYS_SBRK => {
             tf.a0 = crate::kernel::task::sbrk(tf.a0 as isize)
                 .unwrap_or(usize::MAX);
+        }
+        SYS_IPC_CALL_BUF => {
+            let endpoint = tf.a0;
+            let words = [tf.a1, tf.a2, tf.a3, tf.a4];
+            let user_buf = tf.a5;
+            let buf_len = tf.a6;
+            match crate::kernel::ipc::call_buf(endpoint, words, user_buf, buf_len, tf) {
+                crate::kernel::ipc::IpcResult::Continue => {}
+                crate::kernel::ipc::IpcResult::Blocked(next) => return next,
+                crate::kernel::ipc::IpcResult::Error => tf.a0 = usize::MAX,
+            }
+        }
+        SYS_IPC_RECV_BUF => {
+            let endpoint = tf.a0;
+            let user_buf = tf.a1;
+            let capacity = tf.a2;
+            match crate::kernel::ipc::recv_buf(endpoint, user_buf, capacity, tf) {
+                crate::kernel::ipc::IpcResult::Continue => {}
+                crate::kernel::ipc::IpcResult::Blocked(next) => return next,
+                crate::kernel::ipc::IpcResult::Error => tf.a0 = usize::MAX,
+            }
         }
         _ => {
             println!("unknown syscall: {}", syscall_num);
