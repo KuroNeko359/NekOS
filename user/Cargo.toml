@@ -6,6 +6,7 @@ members = [
     "programs/shell",
     "programs/hello",
     "programs/test",
+    "programs/fs-server",
 ]
 
 [profile.release]

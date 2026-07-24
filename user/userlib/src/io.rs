@@ -6,6 +6,8 @@ pub const CONSOLE_ENDPOINT: usize = 1;
 pub const CONSOLE_WRITE: usize = 1;
 pub const CONSOLE_READ: usize = 2;
 
+pub const FS_ENDPOINT: usize = 2;
+
 pub fn write(fd: usize, buf: &[u8]) -> isize {
     if fd != 1 && fd != 2 {
         return -1;

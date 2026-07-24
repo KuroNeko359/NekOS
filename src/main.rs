@@ -42,10 +42,16 @@ pub extern "C" fn kernel_main() -> ! {
     kernel::ipc::register(kernel::ipc::CONSOLE_ENDPOINT, console_pid)
         .expect("Failed to register console endpoint");
 
+    let fs_pid = kernel::exec::spawn("fs-server")
+        .expect("Failed to load fs-server");
+    kernel::ipc::register(kernel::ipc::FS_ENDPOINT, fs_pid)
+        .expect("Failed to register fs-server endpoint");
+    println!("fs-server pid = {}", fs_pid);
+    
     let shell_pid = kernel::exec::spawn("shell")
         .expect("Failed to load shell");
     
-    println!("microkernel: console_pid={} shell_pid={}", console_pid, shell_pid);
+    println!("microkernel: console_pid={} fs_pid={} shell_pid={}", console_pid, fs_pid, shell_pid);
 
     // 进入第一个用户任务；之后的切换都由调度器完成。
     unsafe {

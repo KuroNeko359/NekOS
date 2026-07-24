@@ -6,6 +6,7 @@ pub const MAX_ENDPOINTS: usize = 8;
 pub const CONSOLE_ENDPOINT: usize = 1;
 pub const CONSOLE_WRITE: usize = 1;
 pub const CONSOLE_READ: usize = 2;
+pub const FS_ENDPOINT: usize = 2;
 
 /// 每个 endpoint 最多可排队的待处理消息数。
 pub const MSG_QUEUE_SIZE: usize = 8;
